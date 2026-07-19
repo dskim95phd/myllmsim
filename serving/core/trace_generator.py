@@ -1450,13 +1450,10 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
+                   kv_offload_cpu=False):
 
     model = batch.model
-    config = get_config(model)
-    fp = fp // 8  # bit -> byte of floating point
-    max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
-    variant = resolve_variant(dtype, kv_cache_dtype, config)
 
     # vllm: add load or eviction in the txt file
     load_size = batch.load
@@ -1469,6 +1466,47 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         f"instance{instance_id}_batch{batch.batch_id}.txt",
     )
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    if batch.kind in {BatchKind.KV_EVICT, BatchKind.KV_RELOAD}:
+        if not kv_offload_cpu:
+            raise RuntimeError("CPU KV migration batch requires kv_offload_cpu=True.")
+        if pd_type is None:
+            instance_type = 'COLOCATED'
+        elif pd_type == 'prefill':
+            instance_type = 'PREFILL'
+        elif pd_type == 'decode':
+            instance_type = 'DECODE'
+        else:
+            raise ValueError(f"Unknown instance type {pd_type}.")
+
+        remote = f"REMOTE:{node_id}"
+        if batch.kind is BatchKind.KV_EVICT:
+            operation = [
+                "KV_EVICT_CPU_0", '0', 'LOCAL', '0', remote,
+                str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+            migration_size = evict_size
+        else:
+            operation = [
+                "KV_RELOAD_CPU_0", '0', 'LOCAL', '0', remote,
+                str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+            migration_size = load_size
+
+        with open(output_path, 'w') as f:
+            f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
+            f.write('1\n')
+            f.write(header())
+            f.write(formatter(*operation))
+
+        if power_model is not None:
+            power_model.reset_log()
+            power_model.add_dram_energy_consumption(node_id, migration_size)
+            power_model.print_log(node_id)
+        return
+
+    config = get_config(model)
+    fp = fp // 8  # bit -> byte of floating point
+    max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
+    variant = resolve_variant(dtype, kv_cache_dtype, config)
 
     # make trace — accept either the Mistral-style ``num_local_experts``
     # key or the HF/Qwen3 ``num_experts`` key so both family's configs
@@ -1519,13 +1557,17 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
     # vllm: open output txt file and add load, evict mem
     mem = []
+    # Phase-1 KV offloading always targets the node's CPU DRAM. Do not let a
+    # placement ``kv_evict_loc`` redirect this live-KV swap to CXL.
+    kv_evict_loc = f"REMOTE:{node_id}" if kv_offload_cpu else get_device(
+        placement, None, None, 'kv_evict_loc')
     if load_size != 0:
-        load = ["kv_load", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+        load = ["kv_load", '0', 'LOCAL', '0', kv_evict_loc, str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
         mem.append(load)
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, load_size)
     if evict_size != 0:
-        evict = ["kv_evict", '0', 'LOCAL', '0', get_device(placement, None, None, 'kv_evict_loc'), str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
+        evict = ["kv_evict", '0', 'LOCAL', '0', kv_evict_loc, str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
         mem.append(evict)
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, evict_size)

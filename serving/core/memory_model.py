@@ -13,8 +13,86 @@ class Device(Enum):
     CPU = 2
     CXL = 3
 
+
+class NodeCPUKVPool:
+    """Shared CPU-DRAM capacity for live KV blocks on one simulator node.
+
+    The pool intentionally models only live request KV. Prefix-cache capacity
+    remains owned by its existing RadixCache implementation so Phase 1 CPU
+    offloading cannot silently mix the two ownership domains.
+    """
+
+    def __init__(self, node_id, capacity):
+        self.node_id = node_id
+        self.capacity = capacity
+        self.used = 0
+        self.reserved = 0
+
+    def is_avail(self, size):
+        return size >= 0 and self.used + self.reserved + size <= self.capacity
+
+    def reserve(self, size):
+        self._validate_non_negative(size)
+        if not self.is_avail(size):
+            available = max(0, self.capacity - self.used - self.reserved)
+            raise RuntimeError(
+                f"[NodeCPUKVPool] [node_id={self.node_id}] CPU: tried to reserve "
+                f"{size / MB_TO_BYTE:.2f}MB but only {available / MB_TO_BYTE:.2f}MB is available.")
+        self.reserved += size
+        self._assert_invariants()
+
+    def commit_reservation(self, size):
+        self._validate_reserved(size)
+        self.reserved -= size
+        self.used += size
+        self._assert_invariants()
+
+    def cancel_reservation(self, size):
+        self._validate_reserved(size)
+        self.reserved -= size
+        self._assert_invariants()
+
+    def allocate(self, size):
+        self._validate_non_negative(size)
+        if not self.is_avail(size):
+            available = max(0, self.capacity - self.used - self.reserved)
+            raise RuntimeError(
+                f"[NodeCPUKVPool] [node_id={self.node_id}] CPU: tried to allocate "
+                f"{size / MB_TO_BYTE:.2f}MB but only {available / MB_TO_BYTE:.2f}MB is available.")
+        self.used += size
+        self._assert_invariants()
+
+    def free(self, size):
+        self._validate_non_negative(size)
+        if size > self.used:
+            raise RuntimeError(
+                f"[NodeCPUKVPool] [node_id={self.node_id}] CPU: tried to free "
+                f"{size / MB_TO_BYTE:.2f}MB but only {self.used / MB_TO_BYTE:.2f}MB is used.")
+        self.used -= size
+        self._assert_invariants()
+
+    def _validate_non_negative(self, size):
+        if size < 0:
+            raise ValueError(
+                f"[NodeCPUKVPool] [node_id={self.node_id}] size must be non-negative; got {size}.")
+
+    def _validate_reserved(self, size):
+        self._validate_non_negative(size)
+        if size > self.reserved:
+            raise RuntimeError(
+                f"[NodeCPUKVPool] [node_id={self.node_id}] CPU: tried to consume "
+                f"{size / MB_TO_BYTE:.2f}MB of reservation but only "
+                f"{self.reserved / MB_TO_BYTE:.2f}MB is reserved.")
+
+    def _assert_invariants(self):
+        if self.used < 0 or self.reserved < 0:
+            raise AssertionError("CPU KV pool accounting became negative.")
+        if self.used + self.reserved > self.capacity:
+            raise AssertionError("CPU KV pool used plus reserved exceeds capacity.")
+
+
 class MemoryModel():
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto'):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', cpu_kv_pool=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -25,6 +103,7 @@ class MemoryModel():
         self.npu_mem = npu_mem * GB_TO_BYTE # GB -> Byte
         self.cpu_mem = cpu_mem * GB_TO_BYTE # GB -> Byte
         self.cxl_mem = cxl_mem * GB_TO_BYTE
+        self.cpu_kv_pool = cpu_kv_pool
         self.block_size = block_size
         self.fp = fp // 8 # bit -> byte of floating point
         self.kv_fp = 1 if kv_cache_dtype == 'fp8' else self.fp  # KV cache bytes per element
@@ -51,7 +130,9 @@ class MemoryModel():
         # Memory model
         self.weight = self.get_weight() # assume weight is loaded
         self.npu_used = self.weight
+        self.npu_reserved = 0
         self.cpu_used = 0
+        self.cpu_reserved = 0
         if self.weight > self.npu_mem:
             raise RuntimeError(f"[MemoryModel] [node={self.node_id},inst={self.instance_id}]: Model size {self.weight*self.num_npus//GB_TO_BYTE}GB exceeds total NPU memory {self.npu_mem*self.num_npus//GB_TO_BYTE}GB")
 
@@ -233,24 +314,123 @@ class MemoryModel():
         self.npu_used -= self.weight
 
     def is_free(self):
-        is_free = self.npu_used == 0 and self.cpu_used == 0
+        pool_used = self.cpu_kv_pool.used if self.cpu_kv_pool is not None else 0
+        pool_reserved = self.cpu_kv_pool.reserved if self.cpu_kv_pool is not None else 0
+        is_free = (
+            self.npu_used == 0 and self.npu_reserved == 0 and
+            self.cpu_used == 0 and self.cpu_reserved == 0 and
+            pool_used == 0 and pool_reserved == 0
+        )
         if not is_free:
             self.logger.error(
-                "Memory leak detected: NPU used: %.2fMB, CPU used: %.2fMB",
-                self.node_id,
-                self.instance_id,
+                "Memory leak detected: NPU used/reserved: %.2f/%.2fMB, "
+                "CPU used/reserved: %.2f/%.2fMB, pool used/reserved: %.2f/%.2fMB",
                 self.npu_used / MB_TO_BYTE,
+                self.npu_reserved / MB_TO_BYTE,
                 self.cpu_used / MB_TO_BYTE,
+                self.cpu_reserved / MB_TO_BYTE,
+                pool_used / MB_TO_BYTE,
+                pool_reserved / MB_TO_BYTE,
             )
-        return
+        return is_free
 
     # -------------------- Memory Management --------------------
+
+    def reserve_live_kv(self, size, device):
+        """Reserve destination capacity for a live-KV migration.
+
+        NPU sizes are per rank. CPU sizes are full-cluster bytes. Reservations
+        consume capacity but do not transfer ownership until committed.
+        """
+        if size < 0:
+            raise ValueError(f"Live-KV reservation size must be non-negative; got {size}.")
+        if device == Device.NPU:
+            if self.npu_used + self.npu_reserved + size > self.npu_mem:
+                available = max(0, self.npu_mem - self.npu_used - self.npu_reserved)
+                raise RuntimeError(
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                    f"NPU: tried to reserve {size / MB_TO_BYTE:.2f}MB but only "
+                    f"{available / MB_TO_BYTE:.2f}MB is available.")
+            self.npu_reserved += size
+        elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                self.cpu_kv_pool.reserve(size)
+            else:
+                if self.cpu_used + self.cpu_reserved + size > self.cpu_mem:
+                    available = max(0, self.cpu_mem - self.cpu_used - self.cpu_reserved)
+                    raise RuntimeError(
+                        f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] "
+                        f"CPU: tried to reserve {size / MB_TO_BYTE:.2f}MB but only "
+                        f"{available / MB_TO_BYTE:.2f}MB is available.")
+                self.cpu_reserved += size
+        else:
+            raise RuntimeError(f"Live KV migration does not support destination {device}.")
+        self.assert_capacity_invariants()
+
+    def commit_live_kv_reservation(self, size, device):
+        if size < 0:
+            raise ValueError(f"Live-KV reservation size must be non-negative; got {size}.")
+        if device == Device.NPU:
+            if size > self.npu_reserved:
+                raise RuntimeError(
+                    f"NPU reservation underflow: tried to commit {size} bytes with "
+                    f"{self.npu_reserved} reserved.")
+            self.npu_reserved -= size
+            self.npu_used += size
+        elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                self.cpu_kv_pool.commit_reservation(size)
+            else:
+                if size > self.cpu_reserved:
+                    raise RuntimeError(
+                        f"CPU reservation underflow: tried to commit {size} bytes with "
+                        f"{self.cpu_reserved} reserved.")
+                self.cpu_reserved -= size
+                self.cpu_used += size
+        else:
+            raise RuntimeError(f"Live KV migration does not support destination {device}.")
+        self.assert_capacity_invariants()
+
+    def cancel_live_kv_reservation(self, size, device):
+        if size < 0:
+            raise ValueError(f"Live-KV reservation size must be non-negative; got {size}.")
+        if device == Device.NPU:
+            if size > self.npu_reserved:
+                raise RuntimeError(
+                    f"NPU reservation underflow: tried to cancel {size} bytes with "
+                    f"{self.npu_reserved} reserved.")
+            self.npu_reserved -= size
+        elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                self.cpu_kv_pool.cancel_reservation(size)
+            else:
+                if size > self.cpu_reserved:
+                    raise RuntimeError(
+                        f"CPU reservation underflow: tried to cancel {size} bytes with "
+                        f"{self.cpu_reserved} reserved.")
+                self.cpu_reserved -= size
+        else:
+            raise RuntimeError(f"Live KV migration does not support destination {device}.")
+        self.assert_capacity_invariants()
+
+    def assert_capacity_invariants(self):
+        if self.npu_used < 0 or self.npu_reserved < 0:
+            raise AssertionError("NPU accounting became negative.")
+        if self.npu_used + self.npu_reserved > self.npu_mem:
+            raise AssertionError("NPU used plus reserved exceeds capacity.")
+        if self.cpu_kv_pool is not None:
+            self.cpu_kv_pool._assert_invariants()
+        else:
+            if self.cpu_used < 0 or self.cpu_reserved < 0:
+                raise AssertionError("CPU accounting became negative.")
+            if self.cpu_used + self.cpu_reserved > self.cpu_mem:
+                raise AssertionError("CPU used plus reserved exceeds capacity.")
     
     def allocate(self, size, device):
         if device == Device.NPU:
-            if self.npu_used + size > self.npu_mem:
+            if self.npu_used + self.npu_reserved + size > self.npu_mem:
                 raise RuntimeError(
-                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to load {size / MB_TO_BYTE:.2f}MB but only {(self.npu_mem - self.npu_used) / MB_TO_BYTE:.2f}MB is available."
+                    f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] NPU: tried to load {size / MB_TO_BYTE:.2f}MB but only {(self.npu_mem - self.npu_used - self.npu_reserved) / MB_TO_BYTE:.2f}MB is available."
                 )
             self.logger.info(
                 "NPU: used: %.2fMB load: %.2fMB after: %.2fMB",
@@ -260,13 +440,16 @@ class MemoryModel():
             )
             self.npu_used += size
         elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                self.cpu_kv_pool.allocate(size)
+                return
             if self.prefix_storage == Device.CPU and self.enable_prefix_sharing:
                 self.second_tier_prefix_cache.allocate(size)
             else:
-                if self.cpu_used + size > self.cpu_mem:
+                if self.cpu_used + self.cpu_reserved + size > self.cpu_mem:
                     raise RuntimeError(
                         f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] CPU: tried to load {size / MB_TO_BYTE:.2f}MB "
-                        f"but only {(self.cpu_mem - self.cpu_used) / MB_TO_BYTE:.2f}MB is available."
+                        f"but only {(self.cpu_mem - self.cpu_used - self.cpu_reserved) / MB_TO_BYTE:.2f}MB is available."
                     )
                 self.logger.info(
                     "CPU: used: %.2fMB load: %.2fMB after: %.2fMB",
@@ -295,6 +478,9 @@ class MemoryModel():
             self.npu_used -= size
 
         elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                self.cpu_kv_pool.free(size)
+                return
             if self.prefix_storage == Device.CPU and self.enable_prefix_sharing:
                 self.second_tier_prefix_cache.free(size)
             else:
@@ -317,15 +503,17 @@ class MemoryModel():
     
     def is_avail(self, size, device):
         if device == Device.NPU:
-            if self.npu_mem - self.npu_used >= size:
+            if self.npu_mem - self.npu_used - self.npu_reserved >= size:
                 return True
             else:
                 return False 
         elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                return self.cpu_kv_pool.is_avail(size)
             if self.enable_prefix_sharing:
                 return self.second_tier_prefix_cache.is_avail(size)
             else:
-                if self.cpu_mem - self.cpu_used >= size:
+                if self.cpu_mem - self.cpu_used - self.cpu_reserved >= size:
                     return True
                 else:
                     return False 
@@ -336,16 +524,22 @@ class MemoryModel():
     
     def need_size(self, size, device):
         if device == Device.NPU:
-            needed = (size - (self.npu_mem - self.npu_used))
+            needed = (size - (self.npu_mem - self.npu_used - self.npu_reserved))
             if needed > 0:
                 return needed
             else:
                 return 0
         elif device == Device.CPU:
+            if self.cpu_kv_pool is not None:
+                available = (
+                    self.cpu_kv_pool.capacity - self.cpu_kv_pool.used -
+                    self.cpu_kv_pool.reserved
+                )
+                return max(0, size - available)
             if self.enable_prefix_sharing:
                 return self.second_tier_prefix_cache.need_size(size)
             else:
-                needed = (size - (self.cpu_mem - self.cpu_used))
+                needed = (size - (self.cpu_mem - self.cpu_used - self.cpu_reserved))
                 if needed > 0:
                     return needed
                 else:

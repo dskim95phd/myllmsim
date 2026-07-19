@@ -180,6 +180,14 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 "enable_chunked_prefill", args.enable_chunked_prefill),
             "enable_prefix_caching": instance.get(
                 "enable_prefix_caching", args.enable_prefix_caching),
+            "enable_kv_offloading": instance.get(
+                "enable_kv_offloading", args.enable_kv_offloading),
+            "kv_offload_high_watermark": instance.get(
+                "kv_offload_high_watermark", args.kv_offload_high_watermark),
+            "kv_offload_low_watermark": instance.get(
+                "kv_offload_low_watermark", args.kv_offload_low_watermark),
+            "kv_offload_victim_policy": instance.get(
+                "kv_offload_victim_policy", args.kv_offload_victim_policy),
             "prioritize_prefill": instance.get("prioritize_prefill", args.prioritize_prefill),
             "enable_local_offloading": instance.get(
                 "enable_local_offloading", args.enable_local_offloading),
@@ -187,6 +195,25 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
         })
+        cfg = runtime_configs[-1]
+        high = cfg["kv_offload_high_watermark"]
+        low = cfg["kv_offload_low_watermark"]
+        if not 0 < low <= high <= 1:
+            raise ValueError(
+                "KV offload watermarks must satisfy 0 < low <= high <= 1; "
+                f"got low={low}, high={high} for instance {instance_id}")
+        if cfg["kv_offload_victim_policy"] not in {"lru", "largest-kv"}:
+            raise ValueError(
+                "Unsupported KV offload victim policy "
+                f"'{cfg['kv_offload_victim_policy']}' for instance {instance_id}. "
+                "Supported policies: lru, largest-kv.")
+        if cfg["enable_kv_offloading"] and cfg["enable_prefix_caching"]:
+            raise ValueError(
+                "CPU KV offloading Phase 1 does not support prefix caching. "
+                "Use --no-enable-prefix-caching or disable it for the instance.")
+        if cfg["enable_kv_offloading"] and cfg["enable_attn_offloading"]:
+            raise ValueError(
+                "CPU KV offloading Phase 1 cannot be combined with PIM attention offloading.")
     return runtime_configs
 
 
@@ -242,6 +269,15 @@ def main():
     parser.add_argument('--enable-prefix-caching', action=argparse.BooleanOptionalAction, default=True,
                         help='enable prefix caching via RadixAttention to reuse KV cache across requests '
                         'with shared prefixes (default: enabled). Use --no-enable-prefix-caching to disable')
+    parser.add_argument('--enable-kv-offloading', action=argparse.BooleanOptionalAction, default=False,
+                        help='enable Phase-1 request-level exclusive KV migration between NPU memory and '
+                        'the node-shared CPU DRAM pool. Requires --no-enable-prefix-caching')
+    parser.add_argument('--kv-offload-high-watermark', type=float, default=0.90,
+                        help='NPU KV usage watermark that triggers CPU eviction (0 < value <= 1)')
+    parser.add_argument('--kv-offload-low-watermark', type=float, default=0.80,
+                        help='target NPU KV usage watermark after eviction (0 < value <= high watermark)')
+    parser.add_argument('--kv-offload-victim-policy', choices=['lru', 'largest-kv'], default='lru',
+                        help='request victim policy for CPU KV offloading (lru or largest-kv)')
     parser.add_argument('--enable-chunked-prefill', action=argparse.BooleanOptionalAction, default=True,
                         help='enable chunked prefill to split long prefill requests across multiple iterations, '
                         'matching vLLM v1 behavior (default: enabled). Use --no-enable-chunked-prefill to disable')
@@ -326,6 +362,7 @@ def main():
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(
         astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
+        enable_kv_offloading=args.enable_kv_offloading,
         inputs_root=run_paths.inputs_root)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
@@ -434,6 +471,29 @@ def main():
         else:
             raise NotImplementedError(f"Prefix storage type {prefix_storage} is not supported or memory size is invalid")
 
+    # Phase-1 CPU KV offloading uses one live-KV allocator per node. It is
+    # deliberately separate from prefix-cache pools, which are not supported
+    # in this phase.
+    cpu_kv_pools = {}
+    if any(cfg["enable_kv_offloading"] for cfg in instance_runtime_configs):
+        prefill_nodes = {
+            instance["node_id"] for instance in instances
+            if instance["pd_type"] == "prefill"
+        }
+        decode_nodes = {
+            instance["node_id"] for instance in instances
+            if instance["pd_type"] == "decode"
+        }
+        missing_decode_nodes = sorted(prefill_nodes - decode_nodes)
+        if missing_decode_nodes:
+            raise ValueError(
+                "CPU KV offloading Phase 1 supports only same-node prefill/decode "
+                f"disaggregation; nodes without a decode instance: {missing_decode_nodes}")
+        cpu_kv_pools = {
+            node_id: NodeCPUKVPool(node_id, capacity_gb * GB_TO_BYTE)
+            for node_id, capacity_gb in enumerate(cpu_mem_size)
+        }
+
     schedulers = []
     for instance_id, instance in enumerate(instances):
         prefix_pool_index = prefix_pool_inst_mapping[instance_id]
@@ -461,12 +521,19 @@ def main():
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
+            enable_kv_offloading=inst_cfg["enable_kv_offloading"],
+            kv_offload_high_watermark=inst_cfg["kv_offload_high_watermark"],
+            kv_offload_low_watermark=inst_cfg["kv_offload_low_watermark"],
+            kv_offload_victim_policy=inst_cfg["kv_offload_victim_policy"],
+            cpu_kv_pool=cpu_kv_pools.get(instance["node_id"]),
         ))
 
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(
+        num_instances, schedulers, num_req, request_routing_policy,
+        same_node_pd_only=bool(cpu_kv_pools))
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)
@@ -656,8 +723,9 @@ def main():
                                        dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
-                                       enable_block_copy=inst_cfg["enable_block_copy"],
-                                       inputs_root=run_paths.inputs_root)
+                                        enable_block_copy=inst_cfg["enable_block_copy"],
+                                        inputs_root=run_paths.inputs_root,
+                                        kv_offload_cpu=inst_cfg["enable_kv_offloading"])
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -684,6 +752,10 @@ def main():
                 waiting_request[instance_id] = False
                 instance = instances[instance_id]
                 dg = inst_dp_group.get(instance_id)
+                if new_req.kind is not BatchKind.COMPUTE:
+                    # CPU KV migration is node-local and must not wait for or
+                    # create dummy work in the DP collective barrier.
+                    dg = None
 
                 if dg is not None:
                     # DP group: defer trace generation until all members scheduled
@@ -723,8 +795,9 @@ def main():
                                            dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
-                                           enable_block_copy=inst_cfg["enable_block_copy"],
-                                           inputs_root=run_paths.inputs_root)
+                                            enable_block_copy=inst_cfg["enable_block_copy"],
+                                            inputs_root=run_paths.inputs_root,
+                                            kv_offload_cpu=inst_cfg["enable_kv_offloading"])
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -758,9 +831,10 @@ def main():
                                    inst_cfg["enable_attn_offloading"], power_model, pim_models[node_id],
                                    inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-                                   tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
-                                   enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
+                                    enable_block_copy=inst_cfg["enable_block_copy"],
+                                    inputs_root=run_paths.inputs_root,
+                                    kv_offload_cpu=inst_cfg["enable_kv_offloading"])
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -804,14 +878,18 @@ def main():
 
                 mem = schedulers[inst_id].memory
                 npu_used_mb = mem.npu_used / MB_TO_BYTE
-                npu_util = (mem.npu_used / mem.npu_mem * 100.0) if mem.npu_mem else 0.0
+                npu_reserved_mb = mem.npu_reserved / MB_TO_BYTE
+                npu_util = (
+                    (mem.npu_used + mem.npu_reserved) / mem.npu_mem * 100.0
+                    if mem.npu_mem else 0.0)
 
                 line = (
                     f"{log_indent+tree_indent}Running Instance\\[{inst_id}]: "
                     f"{running_reqs} reqs, Waiting: {waiting_reqs} reqs, "
                     f"Total # {schedulers[inst_id].num_npus} NPUs, "
-                    f"Each NPU Memory Usage {npu_used_mb:.2f} MB "
-                    f"({npu_util:.3f} % Used)"
+                    f"Each NPU Memory Used/Reserved "
+                    f"{npu_used_mb:.2f}/{npu_reserved_mb:.2f} MB "
+                    f"({npu_util:.3f} % Committed)"
                 )
                 if schedulers[inst_id].enable_prefix_caching:
                     line += schedulers[inst_id].memory.npu_prefix_cache.format_prefix_info()
@@ -822,22 +900,31 @@ def main():
                 num_nodes = len(node2inst_mapping)
                 for i, (node_id, inst_ids) in enumerate(node2inst_mapping.items()):
                     node_cpu_usage = 0
+                    node_cpu_reserved = 0
                     inst_usage = []
-                    if any_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU":
+                    if node_id in cpu_kv_pools:
+                        node_cpu_usage = cpu_kv_pools[node_id].used
+                        node_cpu_reserved = cpu_kv_pools[node_id].reserved
+                    elif any_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU":
                         node_cpu_usage = prefix_pools[node_id].total_size() * prefix_pools[node_id].kv_size
                     else:
                         for inst_id in inst_ids:
                             inst_cpu_usage = schedulers[inst_id].memory.cpu_used
                             node_cpu_usage += inst_cpu_usage
+                            node_cpu_reserved += schedulers[inst_id].memory.cpu_reserved
                             inst_usage.append(inst_cpu_usage)
 
-                    cpu_util = (node_cpu_usage / (cpu_mem_size[node_id]*GB_TO_BYTE)) * 100
+                    cpu_util = (
+                        (node_cpu_usage + node_cpu_reserved) /
+                        (cpu_mem_size[node_id] * GB_TO_BYTE) * 100)
                     if prefix_storage != "CXL" and not power_modeling and i == num_nodes - 1:
                         tree_indent = '└─'
                     line = (
                         f"{log_indent+tree_indent}Node\\[{node_id}]: "
-                        f"Total CPU Memory Usage {node_cpu_usage/MB_TO_BYTE:.2f} MB, "
-                        f"{cpu_util:.3f} % Used "
+                        f"Total CPU Memory Used/Reserved "
+                        f"{node_cpu_usage/MB_TO_BYTE:.2f}/"
+                        f"{node_cpu_reserved/MB_TO_BYTE:.2f} MB, "
+                        f"{cpu_util:.3f} % Committed "
                     )
                     if any_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU":
                         line += prefix_pools[node_id].format_prefix_info()

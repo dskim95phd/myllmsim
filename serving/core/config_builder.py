@@ -270,7 +270,46 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
+_HOST_TRANSFER_MODELS = {"pipelined", "serial"}
+
+
+def _host_transfer_config(cpu_mem, required=False):
+    """Validate and translate CPU-to-NPU host-link configuration."""
+    bandwidth = cpu_mem.get("host_link_bw")
+    latency = cpu_mem.get("host_link_latency")
+    model = cpu_mem.get("host_transfer_model", "pipelined")
+    has_model = "host_transfer_model" in cpu_mem
+
+    if required and (bandwidth is None or latency is None):
+        raise KeyError(
+            "CPU KV offloading requires 'host_link_bw' and "
+            "'host_link_latency' in each node's 'cpu_mem' configuration.")
+    if bandwidth is None and latency is None and not has_model:
+        return {}
+    if bandwidth is None or latency is None:
+        raise KeyError(
+            "'host_link_bw' and 'host_link_latency' must be specified together "
+            "in 'cpu_mem'.")
+    if bandwidth <= 0:
+        raise ValueError(f"'host_link_bw' must be positive; got {bandwidth}.")
+    if latency < 0:
+        raise ValueError(f"'host_link_latency' must be non-negative; got {latency}.")
+    if model not in _HOST_TRANSFER_MODELS:
+        raise ValueError(
+            f"Unsupported host_transfer_model '{model}'. Supported: "
+            f"{sorted(_HOST_TRANSFER_MODELS)}")
+
+    return {
+        "host-link-bw": bandwidth,
+        "host-link-latency": latency,
+        "host-transfer-model": model,
+    }
+
+
+def build_cluster_config(
+        astra_sim, cluster_config_path, enable_local_offloading=False,
+        enable_attn_offloading=False, enable_kv_offloading=False,
+        inputs_root=None):
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
     
     try:
@@ -391,6 +430,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     power_configs = []
     cpu_mem_size = []
     cpu_mem_enabled = False  # only one type of cpu memory config is supported for now (latency & bandwidth)
+    remote_mem_signature = None
     node_id = 0
     inst_id = 0
     pim_models = [None for _ in range(num_nodes)]
@@ -464,6 +504,28 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                     raise KeyError(f"Missing required key '{key}' in 'cpu_mem' configuration.")
                 
         cpu_mem_size.append(cpu_mem["mem_size"])
+        node_kv_offloading = any(
+            instance.get("enable_kv_offloading", enable_kv_offloading)
+            for instance in instances
+        )
+        host_transfer = _host_transfer_config(
+            cpu_mem, required=node_kv_offloading)
+
+        # The analytical remote-memory backend currently has one timing
+        # configuration shared by all per-node devices. Reject heterogeneous
+        # timing instead of silently using the first node's values.
+        signature = (
+            cpu_mem["mem_bw"], cpu_mem["mem_latency"],
+            host_transfer.get("host-link-bw"),
+            host_transfer.get("host-link-latency"),
+            host_transfer.get("host-transfer-model"),
+        )
+        if remote_mem_signature is None:
+            remote_mem_signature = signature
+        elif signature != remote_mem_signature:
+            raise ValueError(
+                "CPU memory and host-link timing must be identical across nodes "
+                "for the current PER_NODE_MEMORY_EXPANSION backend.")
 
         if power_modeling: # add mem_size (dram size) to power config
             power = node_config["power"]
@@ -491,6 +553,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 "mem-latency": cpu_mem["mem_latency"],
                 "num-devices": num_nodes
             }
+            memory_config["remote_mem"].update(host_transfer)
             # only one type of PIM memory config is supported for now
             if enable_attn_offloading:
                 memory_config["remote_mem"]["pim-channels"] = cpu_mem["mem_size"] // pim_config["dimm_size"] # one pim channel has one dimm

@@ -3,6 +3,7 @@ import pandas as pd
 from time import time
 import csv
 import os
+from dataclasses import asdict, dataclass
 
 from .request import *
 from .utils import *
@@ -14,13 +15,34 @@ from .logger import print_markup, print_rule
 from .pim_model import *
 import numpy as np
 
+
+@dataclass
+class KVOffloadStats:
+    preemption_count: int = 0
+    evict_bytes: int = 0
+    reload_bytes: int = 0
+    eviction_batches: int = 0
+    reload_batches: int = 0
+    reload_stall_count: int = 0
+    reload_stall_ns: int = 0
+    migration_time_ns: int = 0
+    eviction_time_ns: int = 0
+    reload_time_ns: int = 0
+    npu_peak_used_bytes_per_rank: int = 0
+    npu_peak_reserved_bytes_per_rank: int = 0
+    cpu_peak_used_bytes: int = 0
+    cpu_peak_reserved_bytes: int = 0
+
 # class that shedules request of astra-sim
 class Scheduler:
     def __init__(self, model, node_id, instance_id, max_num_seqs, max_num_batched_tokens,
                  num_npus, tp_size, pp_size, npu_mem, cpu_mem,
                  start_npu, pd_type, fp, block_size, req_num,
                  prioritize_prefill, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, enable_chunked_prefill=False,
-                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto'):
+                 long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
+                 enable_kv_offloading=False, kv_offload_high_watermark=0.90,
+                 kv_offload_low_watermark=0.80, kv_offload_victim_policy='lru',
+                 cpu_kv_pool=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -39,14 +61,22 @@ class Scheduler:
         self.enable_chunked_prefill = enable_chunked_prefill
         self.prefix_storage = prefix_storage
         self.prioritize_prefill = prioritize_prefill
+        self.enable_kv_offloading = enable_kv_offloading
+        self.kv_offload_high_watermark = kv_offload_high_watermark
+        self.kv_offload_low_watermark = kv_offload_low_watermark
+        self.kv_offload_victim_policy = kv_offload_victim_policy
         # lists are sorted in arrival time manner
         self.request = []
         self.inflight = []
         self.done = []
         self.batch_ids = -1
+        self.migration_ids = -1
 
         # memory model
-        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype)
+        self.memory = MemoryModel(model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size, pp_size=pp_size, kv_cache_dtype=kv_cache_dtype, cpu_kv_pool=cpu_kv_pool)
+
+        self.kv_offload_stats = KVOffloadStats()
+        self._record_kv_occupancy()
 
         # logger
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
@@ -61,9 +91,185 @@ class Scheduler:
     def _get_reload_size(self, batch_req, batch_len):
         load_size = 0
         for req in batch_req[:batch_len]:
-            if req.evict:
+            if req.is_kv_on_cpu():
                 load_size += self.memory.get_evict_kv(req)
         return load_size
+
+    def _select_offload_victim(self, requests):
+        """Return one inactive decode request according to the configured policy."""
+        if not requests:
+            return None
+        if self.kv_offload_victim_policy == 'lru':
+            return min(requests, key=lambda req: (req.last_scheduled_ns, req.id))
+        if self.kv_offload_victim_policy == 'largest-kv':
+            return min(
+                requests,
+                key=lambda req: (
+                    -self.memory.get_evict_kv(req),
+                    req.last_scheduled_ns,
+                    req.id,
+                ),
+            )
+        raise RuntimeError(
+            f"Unsupported KV offload victim policy '{self.kv_offload_victim_policy}'. "
+            "Supported policies: 'lru', 'largest-kv'.")
+
+    def _get_kv_offload_stats(self):
+        if not hasattr(self, "kv_offload_stats"):
+            self.kv_offload_stats = KVOffloadStats()
+        return self.kv_offload_stats
+
+    def _record_kv_occupancy(self):
+        stats = self._get_kv_offload_stats()
+        stats.npu_peak_used_bytes_per_rank = max(
+            stats.npu_peak_used_bytes_per_rank, self.memory.npu_used)
+        stats.npu_peak_reserved_bytes_per_rank = max(
+            stats.npu_peak_reserved_bytes_per_rank, self.memory.npu_reserved)
+        if self.memory.cpu_kv_pool is not None:
+            cpu_used = self.memory.cpu_kv_pool.used
+            cpu_reserved = self.memory.cpu_kv_pool.reserved
+        else:
+            cpu_used = self.memory.cpu_used
+            cpu_reserved = self.memory.cpu_reserved
+        stats.cpu_peak_used_bytes = max(stats.cpu_peak_used_bytes, cpu_used)
+        stats.cpu_peak_reserved_bytes = max(
+            stats.cpu_peak_reserved_bytes, cpu_reserved)
+
+    def get_kv_offload_stats(self):
+        """Return a stable copy suitable for reporting and validation."""
+        self._record_kv_occupancy()
+        return asdict(self._get_kv_offload_stats())
+
+    def _cpu_kv_available_bytes(self):
+        if self.memory.cpu_kv_pool is not None:
+            pool = self.memory.cpu_kv_pool
+            return max(0, pool.capacity - pool.used - pool.reserved)
+        return max(
+            0,
+            self.memory.cpu_mem - self.memory.cpu_used - self.memory.cpu_reserved,
+        )
+
+    def _get_migration_id(self):
+        self.migration_ids += 1
+        return self.migration_ids
+
+    def _start_kv_eviction(self, requests, current, sys):
+        """Reserve CPU capacity and create one migration-only eviction batch."""
+        if not requests or self.inflight:
+            return None
+        if len({req.id for req in requests}) != len(requests):
+            raise ValueError("A KV eviction plan cannot contain duplicate requests.")
+        invalid = [req.id for req in requests if not req.is_kv_on_npu()]
+        if invalid:
+            raise RuntimeError(
+                f"KV eviction requires NPU-resident requests; invalid ids: {invalid}")
+
+        sizes = []
+        for req in requests:
+            size = self.memory.get_evict_kv(req)
+            if size > 0:
+                sizes.append((req, size))
+        if not sizes:
+            return None
+        total_per_rank = sum(size for _, size in sizes)
+        total_cpu = total_per_rank * self.num_npus
+        if not self.memory.is_avail(total_cpu, Device.CPU):
+            self.logger.warning(
+                "CPU KV capacity prevents eviction; required=%.2fMB",
+                total_cpu / MB_TO_BYTE)
+            return None
+
+        migration_id = self._get_migration_id()
+        self.memory.reserve_live_kv(total_cpu, Device.CPU)
+        self._record_kv_occupancy()
+        migrations = []
+        try:
+            for req, size_per_rank in sizes:
+                req.begin_kv_offload(migration_id)
+                migrations.append(KVMigration(
+                    migration_id=migration_id,
+                    request_id=req.id,
+                    direction=KVMigrationDirection.NPU_TO_CPU,
+                    bytes_per_rank=size_per_rank,
+                    bytes_full_cluster=size_per_rank * self.num_npus,
+                    submit_time_ns=current,
+                ))
+            batch = Batch(
+                self.get_batch_id(), self.model, 0, 0, [], [], 0, 0,
+                [], [], [], current, 0, evict=total_per_rank,
+                kind=BatchKind.KV_EVICT, migrations=migrations)
+            batch.requests.extend(req for req, _ in sizes)
+            batch.fired.append(sys)
+        except Exception:
+            for req, _ in sizes:
+                if req.kv_migration_id == migration_id:
+                    req.cancel_kv_migration(migration_id)
+            self.memory.cancel_live_kv_reservation(total_cpu, Device.CPU)
+            self._record_kv_occupancy()
+            raise
+
+        self.inflight.append(batch)
+        self.logger.info(
+            "Scheduling KV eviction batch #%d for %d request(s), %.2fMB per rank",
+            batch.batch_id, len(sizes), total_per_rank / MB_TO_BYTE)
+        return batch
+
+    def _start_kv_reload(self, requests, current, sys):
+        """Reserve NPU capacity and create one migration-only reload batch."""
+        if not requests or self.inflight:
+            return None
+        if len({req.id for req in requests}) != len(requests):
+            raise ValueError("A KV reload plan cannot contain duplicate requests.")
+        invalid = [req.id for req in requests if not req.is_kv_on_cpu()]
+        if invalid:
+            raise RuntimeError(
+                f"KV reload requires CPU-resident requests; invalid ids: {invalid}")
+
+        sizes = []
+        for req in requests:
+            size = self.memory.get_evict_kv(req)
+            if size > 0:
+                sizes.append((req, size))
+        if not sizes:
+            return None
+        total_per_rank = sum(size for _, size in sizes)
+        if not self.memory.is_avail(total_per_rank, Device.NPU):
+            return None
+
+        migration_id = self._get_migration_id()
+        self.memory.reserve_live_kv(total_per_rank, Device.NPU)
+        self._record_kv_occupancy()
+        migrations = []
+        try:
+            for req, size_per_rank in sizes:
+                req.begin_kv_reload(migration_id)
+                migrations.append(KVMigration(
+                    migration_id=migration_id,
+                    request_id=req.id,
+                    direction=KVMigrationDirection.CPU_TO_NPU,
+                    bytes_per_rank=size_per_rank,
+                    bytes_full_cluster=size_per_rank * self.num_npus,
+                    submit_time_ns=current,
+                ))
+            batch = Batch(
+                self.get_batch_id(), self.model, 0, 0, [], [], 0, 0,
+                [], [], [], current, 0, load=total_per_rank,
+                kind=BatchKind.KV_RELOAD, migrations=migrations)
+            batch.requests.extend(req for req, _ in sizes)
+            batch.fired.append(sys)
+        except Exception:
+            for req, _ in sizes:
+                if req.kv_migration_id == migration_id:
+                    req.cancel_kv_migration(migration_id)
+            self.memory.cancel_live_kv_reservation(total_per_rank, Device.NPU)
+            self._record_kv_occupancy()
+            raise
+
+        self.inflight.append(batch)
+        self.logger.info(
+            "Scheduling KV reload batch #%d for %d request(s), %.2fMB per rank",
+            batch.batch_id, len(sizes), total_per_rank / MB_TO_BYTE)
+        return batch
 
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
@@ -76,27 +282,57 @@ class Scheduler:
             if len(self.inflight) >= self.pp_size:
                 # wait it to be done
                 return None
+            # The correctness-first baseline does not overlap a migration with
+            # compute or with another migration.
+            if any(batch.kind is not BatchKind.COMPUTE for batch in self.inflight):
+                return None
 
             # scheduling start
-            batch_req = [req for req in self.request if req.arrival <= current]
+            eligible_requests = [
+                req for req in self.request
+                if req.arrival <= current and not req.is_kv_migrating()
+            ]
+            if self.enable_kv_offloading:
+                # A CPU-resident request is preempted waiting work, not a
+                # running decode. Drain the resident queue before considering
+                # swapped work. Merely ordering both groups is insufficient:
+                # when physical capacity exceeds the high watermark, the same
+                # candidate can reload a victim and evict it again next turn.
+                resident_requests = [
+                    req for req in eligible_requests if req.is_kv_on_npu()
+                ]
+                swapped_requests = [
+                    req for req in eligible_requests if req.is_kv_on_cpu()
+                ]
+                eligible_requests = (
+                    resident_requests if resident_requests else swapped_requests
+                )
 
             # max_num_seqs limits total running requests (vLLM behavior)
             running_reqs = sum(len(b.requests) for b in self.inflight)
             available_slots = max(0, int(self.max_num_seqs) - running_reqs)
-            batch_len = min(len(batch_req), available_slots)
+            batch_len = min(len(eligible_requests), available_slots)
 
             # nothing to batch
             if batch_len == 0:
                 return None
 
             # can make batch and proceed
-            batch_req = batch_req[:batch_len]
+            batch_req = eligible_requests[:batch_len]
 
             kv_size = 0
             evict_size = 0
 
             # Get decode requests for preemption decisions
-            gen_req = [req for req in batch_req if not req.is_prefill()]
+            # Victims can come from any runnable decode request on this
+            # instance, not only the requests admitted into this candidate
+            # batch. This lets a prefill-heavy candidate reclaim NPU space
+            # from an older decode request without scheduling that victim.
+            gen_req = [
+                req for req in self.request
+                if (req.arrival <= current and not req.is_prefill() and
+                    req.is_kv_on_npu())
+            ]
             
             if self.prioritize_prefill and not self.enable_chunked_prefill:
                 prefill_req = [req for req in batch_req if req.is_prefill()]
@@ -109,8 +345,19 @@ class Scheduler:
             # Chunked prefill: process decode requests first, then prefill requests
             if self.enable_chunked_prefill:
                 prefills = [req for req in batch_req if req.is_prefill()]
-                decodes = [req for req in batch_req if not req.is_prefill()]
-                batch_req = decodes + prefills
+                if self.enable_kv_offloading:
+                    npu_decodes = [
+                        req for req in batch_req
+                        if not req.is_prefill() and req.is_kv_on_npu()
+                    ]
+                    cpu_decodes = [
+                        req for req in batch_req
+                        if not req.is_prefill() and req.is_kv_on_cpu()
+                    ]
+                    batch_req = npu_decodes + prefills + cpu_decodes
+                else:
+                    decodes = [req for req in batch_req if not req.is_prefill()]
+                    batch_req = decodes + prefills
                 batch_len = len(batch_req)
             
             # ============ STEP 1: Token budget allocation (FIRST) ============
@@ -127,6 +374,8 @@ class Scheduler:
                 # Decode requests first (each decode request = 1 token)
                 for req in batch_req:
                     if not req.is_prefill():
+                        if self.enable_kv_offloading and req.is_kv_on_cpu():
+                            continue
                         if token_budget <= 0:
                             break
                         new_batch_req.append(req)
@@ -144,10 +393,20 @@ class Scheduler:
                         chunk = min(remaining, token_budget)
                         if chunk <= 0:
                             break
-                        req.chunk_len = chunk
                         new_batch_req.append(req)
                         scheduled_tokens[req.id] = chunk
                         token_budget -= chunk
+                # Swapped decodes are waiting work. Consider reload only after
+                # NPU-resident decode and prefill work has consumed its budget.
+                if self.enable_kv_offloading:
+                    for req in batch_req:
+                        if req.is_prefill() or not req.is_kv_on_cpu():
+                            continue
+                        if token_budget <= 0:
+                            break
+                        new_batch_req.append(req)
+                        scheduled_tokens[req.id] = 1
+                        token_budget -= 1
                 batch_req = new_batch_req
                 batch_len = len(batch_req)
 
@@ -179,81 +438,117 @@ class Scheduler:
                 if batch_len == 0:
                     print("     [WARNNING] Cannot load the request to batch due to max_num_batched_tokens limitation")
                     return None
-            # ============ STEP 2: KV size calculation (with scheduled_tokens) ============
-            temp_len = batch_len
+            # ============ STEP 2: KV size calculation and migration planning ============
+            full_kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
+            full_load_size = self._get_reload_size(batch_req, batch_len)
+            admission_limit = (
+                self.memory.npu_mem * self.kv_offload_high_watermark
+                if self.enable_kv_offloading else self.memory.npu_mem
+            )
+            low_watermark_limit = (
+                self.memory.npu_mem * self.kv_offload_low_watermark
+                if self.enable_kv_offloading else self.memory.npu_mem
+            )
+            projected = (
+                self.memory.npu_used + self.memory.npu_reserved +
+                full_kv_size + full_load_size
+            )
+
+            # Plan victims without mutating memory or request state. Crossing
+            # the high watermark triggers eviction toward the low watermark.
+            # If a candidate request becomes a victim, remove it from this
+            # compute plan first so no request is migrated and executed in the
+            # same admission decision.
+            selected_victims = []
+            if self.enable_kv_offloading and projected > admission_limit:
+                background = [req for req in gen_req if req not in batch_req]
+                remaining = [req for req in gen_req if req in batch_req]
+                candidates = background + remaining
+                cpu_available = self._cpu_kv_available_bytes()
+                selected_cpu_bytes = 0
+                while projected > low_watermark_limit and candidates:
+                    victim = self._select_offload_victim(candidates)
+                    candidates.remove(victim)
+                    victim_size = self.memory.get_evict_kv(victim)
+                    victim_cpu_size = victim_size * self.num_npus
+                    if victim_size <= 0:
+                        continue
+                    if victim in batch_req and not any(
+                            req is not victim and req.is_kv_on_npu()
+                            for req in batch_req):
+                        # Do not evict the last NPU-runnable request merely to
+                        # leave swapped work behind; that produces D2H/H2D
+                        # ping-pong without advancing model tokens.
+                        continue
+                    if selected_cpu_bytes + victim_cpu_size > cpu_available:
+                        continue
+                    selected_victims.append(victim)
+                    selected_cpu_bytes += victim_cpu_size
+                    if victim in batch_req:
+                        batch_req.remove(victim)
+                        scheduled_tokens.pop(victim.id, None)
+                        batch_len = len(batch_req)
+                    full_kv_size = self.memory.get_block_kv(
+                        batch_req, batch_len, scheduled_tokens)
+                    full_load_size = self._get_reload_size(batch_req, batch_len)
+                    projected = (
+                        self.memory.npu_used + self.memory.npu_reserved +
+                        full_kv_size + full_load_size -
+                        sum(self.memory.get_evict_kv(req)
+                            for req in selected_victims)
+                    )
+
+            if selected_victims:
+                migration_batch = self._start_kv_eviction(selected_victims, current, sys)
+                if migration_batch is not None:
+                    return migration_batch
+                return None
+
+            # If there is no eligible/capacity-feasible victim, the watermark
+            # cannot be a hard stop: allow progress up to physical capacity
+            # and shrink the candidate as necessary.
+            effective_limit = admission_limit
+            if self.enable_kv_offloading and projected > admission_limit:
+                effective_limit = self.memory.npu_mem
+
+            temp_len = 0
             for i in range(batch_len, -1, -1):
                 kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
                 load_size = self._get_reload_size(batch_req, i)
-                if self.memory.is_avail(kv_size + load_size, Device.NPU):
+                usage_after = (
+                    self.memory.npu_used + self.memory.npu_reserved +
+                    kv_size + load_size
+                )
+                if usage_after <= effective_limit:
                     temp_len = i
                     break
-            
-            # ============ STEP 3: Eviction if needed ============
-            while temp_len == 0:
-                # print("Evict Request to CPU due to memory limitation")
-                # preempt request one by one until there is enough space
-                if len(gen_req) == 0:
-                    return None
-                
-                # check already evicted request
-                if gen_req[-1].evict:
-                    gen_req = gen_req[:-1]
-                    continue
-
-                # else
-                req_to_evict = gen_req[-1]
-                evicted_kv_size = self.memory.get_evict_kv(req_to_evict)
-                evict_size += evicted_kv_size
-                req_to_evict.evict = True
-                self.logger.info("Eviction of the request #%d", req_to_evict.id)
-                gen_req = gen_req[:-1]
-                # spill to cpu (host) memory. get_evict_kv returns per-rank
-                # bytes; cpu_used is tracked in full-cluster bytes (matches
-                # MemoryModel.apply_kv_cache_events convention), so scale by
-                # num_npus when crossing the NPU->CPU boundary.
-                self.memory.free(evicted_kv_size, Device.NPU)
-                self.memory.allocate(evicted_kv_size * self.num_npus, Device.CPU)
-
-                if len(gen_req) < batch_len:
-                    batch_len = len(gen_req)
-
-                # check if can batch
-                for i in range(batch_len, -1, -1):
-                    kv_size = self.memory.get_block_kv(batch_req, i, scheduled_tokens)
-                    load_size = self._get_reload_size(batch_req, i)
-                    if self.memory.is_avail(kv_size + load_size, Device.NPU):
-                        temp_len = i
-                        break
 
             batch_len = temp_len
             batch_req = batch_req[:batch_len]
+
+            if batch_len == 0:
+                return None
+
+            scheduled_tokens = {
+                req.id: scheduled_tokens[req.id]
+                for req in batch_req
+                if req.id in scheduled_tokens
+            }
 
             # Recompute kv_size for final batch
             kv_size = self.memory.get_block_kv(batch_req, batch_len, scheduled_tokens)
             load_size = self._get_reload_size(batch_req, batch_len)
 
-            # delete from request queue
-            for req in batch_req:
-                for i, req_ in enumerate(self.request):
-                    if req_.id == req.id:
-                        del self.request[i]
-                        break
+            # Reload is a separate workload. The request stays queued and no
+            # model tokens advance until the reload completes.
+            reload_requests = [req for req in batch_req if req.is_kv_on_cpu()]
+            if reload_requests:
+                migration_batch = self._start_kv_reload(reload_requests, current, sys)
+                if migration_batch is not None:
+                    return migration_batch
+                return None
 
-                if req.evict:
-                    req.evict = False
-                    self.logger.info("Loading the request #%d", req.id)
-
-            # ============ STEP 4: Allocate memory ============
-            if kv_size > 0:
-                self.memory.allocate(kv_size, Device.NPU)
-
-            # Reload evicted KV to NPU and remove the spilled copy from CPU.
-            # load_size is per-rank, cpu_used is full-cluster.
-            if load_size > 0:
-                self.memory.allocate(load_size, Device.NPU)
-                self.memory.free(load_size * self.num_npus, Device.CPU)
-            
-            # ============ STEP 5: Build batch with lists ============
+            # ============ STEP 4: Build the compute batch without mutation ============
             total_len = 0
             kv_len = 0
             num_prefill = 0
@@ -269,8 +564,6 @@ class Scheduler:
                     chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
 
                     total_len += chunk_size
-                    if req.is_init:  # Only set queuing delay on first chunk
-                        req.set_que_delay(current)
                     q_list.append(chunk_size)
                     prefill_q_list.append(chunk_size)
                     # prefill_k_list: already computed tokens (k_cache from previous chunks)
@@ -290,7 +583,25 @@ class Scheduler:
 
             # make batch, output doesn't matter here!! always one iteration
             # batch is also 1
-            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size, evict_size, load_size)
+            batch = Batch(self.get_batch_id(), self.model, total_len, kv_len, q_list, k_list, num_prefill, num_decode, prefill_q_list, prefill_k_list, decode_k_list, current, kv_size)
+
+            # ============ STEP 5: Commit admission ============
+            # Capacity allocation is the only fallible operation below. Keep
+            # request fields and the scheduler queue unchanged until it passes.
+            if kv_size > 0:
+                self.memory.allocate(kv_size, Device.NPU)
+                self._record_kv_occupancy()
+
+            admitted_ids = {req.id for req in batch_req}
+            self.request = [
+                req for req in self.request if req.id not in admitted_ids
+            ]
+            for req in batch_req:
+                if req.is_prefill():
+                    req.chunk_len = scheduled_tokens[req.id]
+                    if req.is_init:
+                        req.set_que_delay(current)
+
             # add already fired system
             batch.fired.append(sys)
             batch.requests.extend(batch_req)
@@ -692,9 +1003,44 @@ class Scheduler:
             "Batch #%d is done",
             batch.batch_id,
         )
-                
+
+        if batch.kind in {BatchKind.KV_EVICT, BatchKind.KV_RELOAD}:
+            requests_by_id = {req.id: req for req in batch.requests}
+            stats = self._get_kv_offload_stats()
+            duration_ns = max(0, finish - batch.batch_time)
+            stats.migration_time_ns += duration_ns
+            if batch.kind is BatchKind.KV_EVICT:
+                total_cpu = sum(m.bytes_full_cluster for m in batch.migrations)
+                total_per_rank = sum(m.bytes_per_rank for m in batch.migrations)
+                self.memory.commit_live_kv_reservation(total_cpu, Device.CPU)
+                self.memory.free(total_per_rank, Device.NPU)
+                for migration in batch.migrations:
+                    requests_by_id[migration.request_id].complete_kv_offload(
+                        migration.migration_id)
+                stats.preemption_count += len(batch.migrations)
+                stats.evict_bytes += total_cpu
+                stats.eviction_batches += 1
+                stats.eviction_time_ns += duration_ns
+            else:
+                total_per_rank = sum(m.bytes_per_rank for m in batch.migrations)
+                total_cpu = sum(m.bytes_full_cluster for m in batch.migrations)
+                self.memory.commit_live_kv_reservation(total_per_rank, Device.NPU)
+                self.memory.free(total_cpu, Device.CPU)
+                for migration in batch.migrations:
+                    requests_by_id[migration.request_id].complete_kv_reload(
+                        migration.migration_id)
+                stats.reload_bytes += total_cpu
+                stats.reload_batches += 1
+                stats.reload_stall_count += len(batch.migrations)
+                stats.reload_stall_ns += duration_ns * len(batch.migrations)
+                stats.reload_time_ns += duration_ns
+            self._record_kv_occupancy()
+            del self.inflight[idx]
+            return prompt_t, gen_t, end_reqs
+
         pool = []
         for req in batch.requests:
+            req.last_scheduled_ns = finish
             # For chunked prefill, use computed tokens to determine prefill vs decode
             # Use is_prefill() method which checks num_computed_tokens < original_input
             is_prefill_req = req.is_prefill()
@@ -808,6 +1154,7 @@ class Scheduler:
             self.request = pool + self.request
         del self.inflight[idx]
         del batch
+        self._record_kv_occupancy()
 
         return prompt_t, gen_t, end_reqs
     
@@ -828,6 +1175,7 @@ class Scheduler:
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
         req.instance_id = self.instance_id
+        req.mark_kv_on_npu()
         self.request.append(req)
         if self.enable_prefix_caching:
             self.memory.prefix_match(req)
@@ -902,6 +1250,26 @@ class Scheduler:
         _render("Time to First Token", ttft_values)
         _render("Time per Output Token (excl. 1st token)", tpot_values)
         _render("Inter-token Latency", itl_values, num_space=1)
+
+        if self.enable_kv_offloading:
+            stats = self.get_kv_offload_stats()
+            print_rule("[sim.tagline]CPU KV Offloading[/]")
+            print_markup(
+                f"Preemptions: {stats['preemption_count']}, "
+                f"evicted/reloaded: "
+                f"{stats['evict_bytes'] / MB_TO_BYTE:.2f}/"
+                f"{stats['reload_bytes'] / MB_TO_BYTE:.2f} MB")
+            print_markup(
+                f"Migration time: {stats['migration_time_ns'] / 1_000_000:.3f} ms, "
+                f"reload request stalls: {stats['reload_stall_count']} "
+                f"({stats['reload_stall_ns'] / 1_000_000:.3f} ms total)")
+            print_markup(
+                "Peak NPU used/reserved per rank: "
+                f"{stats['npu_peak_used_bytes_per_rank'] / MB_TO_BYTE:.2f}/"
+                f"{stats['npu_peak_reserved_bytes_per_rank'] / MB_TO_BYTE:.2f} MB, "
+                "peak CPU used/reserved: "
+                f"{stats['cpu_peak_used_bytes'] / MB_TO_BYTE:.2f}/"
+                f"{stats['cpu_peak_reserved_bytes'] / MB_TO_BYTE:.2f} MB")
 
     # print each request results
     def print_request_result(self):

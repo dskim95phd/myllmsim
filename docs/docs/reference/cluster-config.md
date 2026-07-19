@@ -68,7 +68,14 @@ field.
 ```json
 {
   "num_instances": 2,
-  "cpu_mem": {"mem_size": 512, "mem_bw": 256, "mem_latency": 0},
+  "cpu_mem": {
+    "mem_size": 512,
+    "mem_bw": 256,
+    "mem_latency": 80,
+    "host_link_bw": 64,
+    "host_link_latency": 800,
+    "host_transfer_model": "pipelined"
+  },
   "instances": [...],
   "power": {...},
   "cpu_mem.pim_config": "DDR4_8GB_3200_pim"
@@ -89,7 +96,17 @@ field.
 | `mem_size` | float | ✓ | Host CPU memory capacity in **GB** |
 | `mem_bw` | float | ✓ | CPU memory bandwidth in **GB/s** |
 | `mem_latency` | float | ✓ | CPU memory latency in **ns** |
+| `host_link_bw` | float | with CPU KV offloading | CPU-to-NPU link bandwidth in **GB/s** |
+| `host_link_latency` | float | with CPU KV offloading | CPU-to-NPU link latency in **ns** |
+| `host_transfer_model` | string | optional | `pipelined` (default) or diagnostic `serial` timing |
 | `pim_config` | string | optional | Name of a PIM device config in `configs/pim/`. See **[PIM config](./pim-config)** |
+
+The top-level `link_bw` and `link_latency` describe the NPU collective
+network and are not reused for CPU KV migration. In `pipelined` mode, a
+migration of `bytes` takes
+`mem_latency + host_link_latency + ceil(bytes / min(mem_bw, host_link_bw))`
+nanoseconds. All nodes must currently use identical CPU-memory and host-link
+timing because the analytical backend has one shared remote-memory config.
 
 ### `power` (optional)
 
@@ -184,6 +201,10 @@ value still falls back to the model config's `torch_dtype`.
 | `kv_cache_dtype` | string | `--kv-cache-dtype` | KV-cache dtype for memory accounting and profile variant selection |
 | `enable_chunked_prefill` | bool | `--enable-chunked-prefill` | Enable chunked prefill in this instance's scheduler |
 | `enable_prefix_caching` | bool | `--enable-prefix-caching` | Enable this instance's local prefix cache |
+| `enable_kv_offloading` | bool | `--enable-kv-offloading` | Migrate complete live-request KV state between NPU and node-shared CPU DRAM |
+| `kv_offload_high_watermark` | float | `--kv-offload-high-watermark` | NPU KV pressure level that triggers eviction |
+| `kv_offload_low_watermark` | float | `--kv-offload-low-watermark` | NPU KV target after eviction; must not exceed the high watermark |
+| `kv_offload_victim_policy` | string | `--kv-offload-victim-policy` | CPU KV victim policy: `lru` (default) or `largest-kv` |
 | `prioritize_prefill` | bool | `--prioritize-prefill` | Prefer prefill requests when forming batches |
 | `enable_local_offloading` | bool | `--enable-local-offloading` | Emit graph conversion with local offloading for this instance |
 | `enable_attn_offloading` | bool | `--enable-attn-offloading` | Emit PIM attention offload for this instance |

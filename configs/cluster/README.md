@@ -18,7 +18,10 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
       "cpu_mem": {
         "mem_size": 512,
         "mem_bw": 256,
-        "mem_latency": 0
+        "mem_latency": 0,
+        "host_link_bw": 64,
+        "host_link_latency": 800,
+        "host_transfer_model": "pipelined"
       },
       "instances": [
         {
@@ -55,6 +58,9 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `cpu_mem.mem_size` | Float | CPU memory capacity in GB |
 | `cpu_mem.mem_bw` | Float | CPU memory bandwidth in GB/s |
 | `cpu_mem.mem_latency` | Float | CPU memory latency in ns |
+| `cpu_mem.host_link_bw` | Float | CPU-to-NPU link bandwidth in GB/s; required for CPU KV offloading |
+| `cpu_mem.host_link_latency` | Float | CPU-to-NPU link latency in ns; required for CPU KV offloading |
+| `cpu_mem.host_transfer_model` | String | `pipelined` (default) or diagnostic `serial` transfer timing |
 
 ### Per-instance fields
 
@@ -77,6 +83,10 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `kv_cache_dtype` | String | No | Per-instance override for `--kv-cache-dtype` |
 | `enable_chunked_prefill` | Boolean | No | Per-instance override for `--enable-chunked-prefill` |
 | `enable_prefix_caching` | Boolean | No | Per-instance override for `--enable-prefix-caching` |
+| `enable_kv_offloading` | Boolean | No | Enable request-level live-KV migration to node-shared CPU DRAM |
+| `kv_offload_high_watermark` | Float | No | NPU KV pressure level that triggers eviction (default: 0.90) |
+| `kv_offload_low_watermark` | Float | No | NPU KV target after eviction (default: 0.80) |
+| `kv_offload_victim_policy` | String | No | CPU KV victim policy: `lru` (default) or `largest-kv` |
 | `prioritize_prefill` | Boolean | No | Per-instance override for `--prioritize-prefill` |
 | `enable_local_offloading` | Boolean | No | Per-instance override for `--enable-local-offloading` |
 | `enable_attn_offloading` | Boolean | No | Per-instance override for `--enable-attn-offloading` |
@@ -154,7 +164,8 @@ weights are sharded by `ep_size` (each instance holds `num_local_experts // ep_s
 
 | File | Description |
 | --- | --- |
-| `single_node_single_instance.json` | Single node, Qwen3-32B with TP=2 (default) |
+| `single_node_single_instance.json` | Single node, one dense-model instance (default) |
+| `single_node_single_instance_kv_offload.json` | Single-node CPU KV offloading with explicit host-link timing |
 | `single_node_single_instance_H100.json` | Single node on H100 with TP=4 |
 | `single_node_multi_instance.json` | Single node, two instances |
 | `single_node_pd_instance.json` | Single node with prefill/decode disaggregation |

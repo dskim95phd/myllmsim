@@ -10,7 +10,8 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",
-            seed=42
+            seed=42,
+            same_node_pd_only=False,
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -21,6 +22,7 @@ class Router:
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
+        self.same_node_pd_only = same_node_pd_only
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
@@ -323,5 +325,19 @@ class Router:
 
     def transfer_prefill_request(self, requests):
         for req in requests:
-            instance_id = self._select_instance(self.decode_schedulers, "decode")
-            self.decode_schedulers[instance_id].add_decode(req)
+            if not self.same_node_pd_only:
+                instance_id = self._select_instance(self.decode_schedulers, "decode")
+                self.decode_schedulers[instance_id].add_decode(req)
+                continue
+            prefill_node_id = self.schedulers[req.instance_id].node_id
+            local_decodes = [
+                scheduler for scheduler in self.decode_schedulers
+                if scheduler.node_id == prefill_node_id
+            ]
+            if not local_decodes:
+                raise RuntimeError(
+                    f"No decode instance on node {prefill_node_id} for prefill "
+                    f"request #{req.id}. CPU KV offloading Phase 1 supports "
+                    "same-node prefill/decode disaggregation only.")
+            decode_index = self._select_instance(local_decodes, "decode")
+            self.decode_schedulers[decode_index].add_decode(req)

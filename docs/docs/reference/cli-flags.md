@@ -52,11 +52,28 @@ matching runtime knobs per `instances[i]`; see
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--enable-prefix-caching` | `True` | RadixAttention prefix caching. Use `--no-enable-prefix-caching` to disable |
+| `--enable-kv-offloading` | `False` | Phase-1 request-level exclusive migration between NPU KV and node-shared CPU DRAM. Requires `--no-enable-prefix-caching`; same-node PD only |
+| `--kv-offload-high-watermark` | `0.90` | NPU-KV pressure level that starts CPU eviction |
+| `--kv-offload-low-watermark` | `0.80` | NPU-KV target after CPU eviction; must be no greater than the high watermark |
+| `--kv-offload-victim-policy` | `lru` | Victim selector for CPU offload: `lru` or `largest-kv` |
 | `--enable-prefix-sharing` | off | Second-tier prefix pool shared across instances within a node |
 | `--prefix-storage` | `None` | Where the second-tier pool lives. `None` / `CPU` / `CXL` |
 | `--enable-local-offloading` | off | Weight offloading to NPU (counts weight reads in profiling) |
 | `--enable-attn-offloading` | off | Attention computation offloading to PIM |
 | `--enable-sub-batch-interleaving` | off | Overlap GPU compute with PIM attention. Requires `--enable-attn-offloading` |
+
+CPU KV offloading also requires `cpu_mem.host_link_bw` and
+`cpu_mem.host_link_latency` in the cluster config. These values model the
+CPU-to-NPU path independently from the top-level NPU collective link. See
+**[Cluster config](./cluster-config#cpu_mem)**.
+
+While a simulation is running, heartbeat lines report used and reserved NPU
+memory per rank and used and reserved CPU memory per node. The final
+per-instance CPU KV offloading summary reports preemptions, aggregate D2H/H2D
+bytes, migration time, reload stall count and time, and peak used/reserved
+occupancy. A CPU-resident request remains in the swapped queue while any
+NPU-resident work is runnable, preventing an immediate reload/evict cycle
+under sustained watermark pressure.
 
 ## Dataset and output
 
@@ -96,6 +113,7 @@ removed after a successful simulation by default.
 | MoE expert parallel | (cluster config `ep_size`) |
 | DP+EP MoE | (cluster config `dp_group`) |
 | Prefix caching | `--enable-prefix-caching` (default on), `--enable-prefix-sharing`, `--prefix-storage` |
+| CPU KV offload | `--enable-kv-offloading --no-enable-prefix-caching` |
 | Chunked prefill | `--enable-chunked-prefill` (default on), `--long-prefill-token-threshold` |
 | PIM attention offload | `--enable-attn-offloading` (cluster config sets `pim_config`) |
 | FP8 KV cache | `--kv-cache-dtype fp8` |
