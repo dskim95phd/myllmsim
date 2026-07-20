@@ -19,10 +19,18 @@ def main() -> int:
     from workloads.generators.sharegpt import register_args as sg_register
     sg_register(sg)
 
+    session_kv = sub.add_parser(
+        "session-kv", help="Synthetic append-only agentic sessions")
+    from workloads.generators.session_kv import register_args as session_kv_register
+    session_kv_register(session_kv)
+
     args = parser.parse_args()
 
     if args.generator == "sharegpt":
         from workloads.generators.sharegpt import run
+        return run(args)
+    if args.generator == "session-kv":
+        from workloads.generators.session_kv import run
         return run(args)
 
     parser.error(f"Unknown generator: {args.generator}")
