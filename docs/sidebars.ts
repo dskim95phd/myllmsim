@@ -142,6 +142,9 @@ const sidebars: SidebarsConfig = {
     'contributor/codebase-tour',
     'contributor/conventions',
     'contributor/validating-changes',
+    'contributor/cpu-kv-offloading-experiment',
+    'contributor/cpu-kv-offloading-pilot-report',
+    'contributor/cpu-kv-offloading-server-runbook',
     'contributor/pr-workflow',
   ],
 };
