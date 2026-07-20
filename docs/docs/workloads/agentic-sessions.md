@@ -75,6 +75,86 @@ final tool_duration could exit prematurely between sub-requests).
 For the full lifecycle, see
 **[Simulator → Request lifecycle](/docs/simulator/request-lifecycle#agentic-sessions-when-stage-10-is-not-the-end)**.
 
+## Reusing KV within one session
+
+For append-only agent or conversation turns, add
+`"reuse_previous_kv": true` to the session and run with
+`--enable-session-kv-retention --no-enable-prefix-caching`. The router pins
+the session to its first colocated scheduler. A completed non-terminal turn
+parks its existing allocation, and the next turn claims it and computes only
+the uncached input suffix.
+
+Add `--enable-kv-offloading` to let memory pressure move parked session KV to
+the node-shared CPU pool. The migration uses the configured host-link and CPU
+memory timing. A continuation that hits CPU-resident state waits for its H2D
+reload to complete before computing the suffix; it never attends directly to
+CPU memory. If active-request eviction needs the remaining CPU capacity, the
+simulator drops LRU parked session state first and records a future miss.
+Generic prefix caching remains unsupported in this mode.
+
+For same-node prefill/decode disaggregation, enable both session retention and
+CPU KV offloading on every prefill and decode instance. A non-terminal decode
+turn always parks through a modeled D2H workload. The next turn reloads the
+CPU record into its affinitized prefill instance through a modeled H2D
+workload before computing the suffix. This decode-to-prefill bridge is never a
+free ownership change. Cross-node PD session reuse is not supported.
+
+Use `--session-kv-ttl-ns` to set a default maximum idle lifetime, or add
+`session_kv_ttl_ns` to one session record to override it. The timer starts
+when a non-terminal turn completes. `0` disables expiry. The simulator wakes
+at the expiry event during long tool or human pauses, and expiration wins if
+the next turn arrives at the exact same timestamp.
+
+This mode does not require `input_tok_ids` and never shares KV across two
+different session ids. Use a per-turn `reused_prefix_toks` scalar when a
+context was truncated or summarized. See the
+**[session-retention schema](./jsonl-format#session-kv-retention-without-token-ids)**
+for fields and current implementation limits.
+
+## Runnable session-retention examples
+
+The bundled colocated example retains KV on the NPU across a 100 ms tool wait:
+
+```bash
+python -m serving \
+  --cluster-config configs/cluster/single_node_session_kv_retention.json \
+  --dtype bfloat16 --block-size 16 \
+  --dataset workloads/example_session_retention.jsonl \
+  --output outputs/session_retention.csv \
+  --num-reqs 1
+```
+
+The second turn has 15 input tokens and reuses 13 predecessor tokens, so its
+prefill computes only the 2-token suffix. The companion
+`outputs/session_retention_kv_offload.csv` sidecar records the NPU hit.
+
+To exercise hard expiry, set a TTL shorter than the 100 ms tool wait:
+
+```bash
+python -m serving \
+  --cluster-config configs/cluster/single_node_session_kv_retention.json \
+  --dtype bfloat16 --block-size 16 \
+  --dataset workloads/example_session_retention.jsonl \
+  --output outputs/session_retention_ttl.csv \
+  --num-reqs 1 --session-kv-ttl-ns 20000000
+```
+
+The 20 ms TTL expires during the wait, so the second turn is a full-prefill
+miss. For the same-node PD CPU bridge, including the zero-wait boundary:
+
+```bash
+python -m serving \
+  --cluster-config configs/cluster/single_node_pd_session_kv_retention.json \
+  --dtype bfloat16 --block-size 16 \
+  --dataset workloads/example_session_retention_zero_wait.jsonl \
+  --output outputs/session_retention_pd.csv \
+  --num-reqs 1
+```
+
+This run performs a decode-side D2H park and a prefill-side H2D reload before
+the 2-token suffix. Inspect the sidecar to distinguish these migration bytes
+from the ordinary forward prefill-to-decode handoffs.
+
 ## Bundled SWE-bench example
 
 The repo ships
@@ -94,10 +174,10 @@ python -m serving \
   --dtype bfloat16 --block-size 16 \
   --dataset 'workloads/swe-bench-qwen3-30b-a3b-50-sps0.2.jsonl' \
   --output 'outputs/swebench_run.csv' \
-  --num-req 1
+  --num-reqs 1
 ```
 
-`--num-req 1` means one *session* (which expands to 8-15
+`--num-reqs 1` means one *session* (which expands to 8-15
 sub-requests). Bump it for longer runs.
 
 ## Building your own agentic workload
@@ -189,15 +269,12 @@ with agentic sessions.
 2. **Session arrival_time_ns is for the *first* sub-request.**
    Subsequent sub-requests have their arrival times computed at run
    time as `previous_completion + tool_duration_ns`.
-3. **Pre-tokenize for prefix caching.** Agentic sessions usually have
-   *very* high prefix overlap between sub-requests (each call shares
-   the system prompt + previous turns). Without
-   `input_tok_ids`, you lose the bulk of the savings.
-4. **Sessions are scheduled to whichever instance is least loaded
-   at the time of *each* sub-request's release.** A long agent run
-   could hop between instances in a multi-instance config. If you
-   want sticky session-to-instance affinity, use `CUSTOM` routing
-   (see `serving/core/router.py`).
+3. **Choose one cache model.** Generic cross-session prefix caching needs
+   `input_tok_ids`. Same-session KV retention does not: it uses session order
+   and scalar token counts, and must run with generic prefix caching disabled.
+4. **Affinity depends on the mode.** Session-retention continuations remain
+   affinitized to their original colocated prefill scheduler. Without session
+   retention, independent turns are routed by the selected request policy.
 
 ## What's next
 

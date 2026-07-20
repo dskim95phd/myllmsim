@@ -5,11 +5,12 @@ sidebar_position: 8
 
 # Reading the output
 
-The simulator produces three kinds of output:
+The simulator produces four kinds of output:
 
 1. **Per-request CSV** at the path passed via `--output`.
-2. **Throughput log line** printed every `--log-interval` seconds.
-3. **Final power summary** (only if the cluster config has a
+2. **CPU KV offload sidecar CSV** when CPU KV offloading is enabled.
+3. **Throughput log line** printed every `--log-interval` seconds.
+4. **Final power summary** (only if the cluster config has a
    `power:` block).
 
 This page covers what each one means and how to read them.
@@ -50,14 +51,57 @@ All times are in **nanoseconds**. Divide by `1e9` for seconds, `1e6`
 for milliseconds. Column names use spaces, not underscores; quote
 them in pandas (`df["instance id"]`).
 
+## KV migration and session sidecar CSV
+
+When CPU KV offloading or session KV retention is enabled and
+`--output outputs/foo.csv` is set, the simulator also writes
+`outputs/foo_kv_offload.csv`. The sidecar contains one row per relevant
+instance, including prefill instances that do not own final per-request rows.
+
+| Column | Unit | Meaning |
+| --- | --- | --- |
+| `instance id`, `node id` | id | Instance and host node represented by the row |
+| `preemption count` | requests | Active requests selected for CPU eviction; parked-session eviction does not increment it |
+| `eviction batches`, `reload batches` | batches | Completed migration-only D2H and H2D workloads for active requests or parked sessions |
+| `evict bytes`, `reload bytes` | bytes | Full-cluster active-request and parked-session bytes migrated in each direction |
+| `migration time ns` | ns | Sum of completed eviction and reload workload durations |
+| `eviction time ns`, `reload time ns` | ns | Direction-specific completed workload durations |
+| `reload stall count` | requests | Reloaded active requests or session continuations that waited for an H2D workload |
+| `reload stall ns` | ns-request | Reload duration summed once per stalled active request or continuation |
+| `npu peak used bytes per rank` | bytes/rank | Peak committed live KV on one rank of the instance |
+| `npu peak reserved bytes per rank` | bytes/rank | Peak destination reservation on one rank |
+| `cpu peak used bytes` | bytes/node | Peak committed live KV in the node-shared CPU pool |
+| `cpu peak reserved bytes` | bytes/node | Peak destination reservation in the node-shared CPU pool |
+| `pd handoff count` | requests | Same-node prefill-to-decode ownership transfers |
+| `pd handoff bytes` | bytes | Full-cluster prompt-KV bytes transferred between instance ownership domains |
+| `pd handoff wait ns` | ns | Sum of decode-admission wait time for PD handoffs |
+| `session npu hit count`, `session npu hit tokens` | count, tokens | Colocated continuations served from retained NPU state |
+| `session cpu hit count`, `session cpu hit tokens` | count, tokens | Colocated or PD continuations whose CPU state completed H2D and became usable; provisional claims that expire or are dropped count as misses instead |
+| `session cpu reload bytes`, `session cpu reload time ns` | bytes, ns | Session-specific H2D volume and completed workload time |
+| `session miss count`, `session recomputed prompt tokens` | count, tokens | Declared continuations that performed full prefill |
+| `session ttl expiration count` | sessions | Hard-TTL invalidations |
+| `session ttl npu bytes freed`, `session ttl cpu bytes freed` | bytes | Bytes released by TTL, split by source tier |
+| `session capacity drop count`, `session capacity drop bytes` | sessions, bytes | Optional parked state discarded under CPU pressure |
+| `session parked npu byte ns`, `session parked cpu byte ns` | byte-ns | Time-integrated parked occupancy by tier |
+| `session peak parked npu bytes per rank` | bytes/rank | Peak parked NPU session allocation on one rank |
+| `session peak parked cpu bytes` | bytes/node | Peak parked CPU session allocation owned by the instance |
+| `session reload wait ns` | ns | Time from continuation arrival until its retained CPU state becomes NPU-usable, including pending D2H, admission, and H2D time |
+| `session current parked` | sessions | Session records still parked at reporting time |
+| `session terminal cleanup count`, `session terminal cleanup bytes` | sessions, bytes | Final-turn cleanup operations and released allocation |
+
+CPU peak fields describe a node-shared pool, so multiple offload-enabled
+instances on the same node can report the same peak. A forward prefill-to-
+decode PD handoff is an ownership and capacity transfer within NPU memory and
+does not by itself add D2H or H2D bytes. Session continuation in the reverse
+decode-to-prefill direction is separately modeled as decode D2H plus prefill
+H2D and appears in the migration and session columns.
+
 > **Note:** `Request` objects internally also carry `session_id` /
 > `sub_request_index` (for agentic workloads) and per-tier prefix-
 > cache hit counters (`prefix_cache_hit`, `npu_cache_hit`,
-> `storage_cache_hit`). These are tracked in memory and surfaced in
-> the throughput log line, but are **not** written to the per-request
-> CSV today. Use the throughput log (with `--log-interval`) to see
-> aggregate prefix-hit rates; for per-request agentic accounting,
-> read the `Request` objects directly or extend `Scheduler.save_output`.
+> `storage_cache_hit`). These are not written to the per-request CSV.
+> Aggregate session hit, miss, migration, expiry, pressure-drop, and cleanup
+> metrics are available in the sidecar above.
 
 ### Common derived metrics
 

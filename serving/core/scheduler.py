@@ -32,6 +32,37 @@ class KVOffloadStats:
     npu_peak_reserved_bytes_per_rank: int = 0
     cpu_peak_used_bytes: int = 0
     cpu_peak_reserved_bytes: int = 0
+    pd_handoff_count: int = 0
+    pd_handoff_bytes: int = 0
+    pd_handoff_wait_ns: int = 0
+    session_npu_hit_count: int = 0
+    session_npu_hit_tokens: int = 0
+    session_cpu_hit_count: int = 0
+    session_cpu_hit_tokens: int = 0
+    session_cpu_reload_bytes: int = 0
+    session_cpu_reload_time_ns: int = 0
+    session_miss_count: int = 0
+    session_recomputed_prompt_tokens: int = 0
+    session_ttl_expiration_count: int = 0
+    session_ttl_npu_bytes_freed: int = 0
+    session_ttl_cpu_bytes_freed: int = 0
+    session_capacity_drop_count: int = 0
+    session_capacity_drop_bytes: int = 0
+    session_parked_npu_byte_ns: int = 0
+    session_parked_cpu_byte_ns: int = 0
+    session_peak_parked_npu_bytes_per_rank: int = 0
+    session_peak_parked_cpu_bytes: int = 0
+    session_reload_wait_ns: int = 0
+    session_current_parked: int = 0
+    session_terminal_cleanup_count: int = 0
+    session_terminal_cleanup_bytes: int = 0
+
+
+@dataclass
+class PendingPDHandoff:
+    request: Request
+    source_scheduler: object
+    submit_time_ns: int
 
 # class that shedules request of astra-sim
 class Scheduler:
@@ -42,7 +73,8 @@ class Scheduler:
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
                  enable_kv_offloading=False, kv_offload_high_watermark=0.90,
                  kv_offload_low_watermark=0.80, kv_offload_victim_policy='lru',
-                 cpu_kv_pool=None):
+                 cpu_kv_pool=None, enable_session_kv_retention=False,
+                 session_kv_ttl_ns=0):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -65,10 +97,14 @@ class Scheduler:
         self.kv_offload_high_watermark = kv_offload_high_watermark
         self.kv_offload_low_watermark = kv_offload_low_watermark
         self.kv_offload_victim_policy = kv_offload_victim_policy
+        self.enable_session_kv_retention = enable_session_kv_retention
+        self.session_kv_ttl_ns = session_kv_ttl_ns
         # lists are sorted in arrival time manner
         self.request = []
         self.inflight = []
         self.done = []
+        self.pending_pd_handoffs = []
+        self.session_kv_states = {}
         self.batch_ids = -1
         self.migration_ids = -1
 
@@ -88,10 +124,455 @@ class Scheduler:
         else:
             return self.schedule_base(current, sys, batch_id)
 
+    def enqueue_pd_handoff(self, req, source_scheduler, submit_time_ns):
+        """Queue a completed prefill without changing ownership or capacity."""
+        if self.pd_type != "decode":
+            raise RuntimeError(
+                f"PD handoff target instance {self.instance_id} is not a decode instance.")
+        if source_scheduler.pd_type != "prefill":
+            raise RuntimeError(
+                f"PD handoff source instance {source_scheduler.instance_id} is not a prefill instance.")
+        if self.node_id != source_scheduler.node_id:
+            raise RuntimeError(
+                "CPU KV offloading supports same-node PD handoff only: "
+                f"source node {source_scheduler.node_id}, destination node {self.node_id}.")
+        if req.kv_owner_instance_id != source_scheduler.instance_id:
+            raise RuntimeError(
+                f"Request #{req.id} is owned by instance "
+                f"{req.kv_owner_instance_id}, not source instance "
+                f"{source_scheduler.instance_id}.")
+        if not req.is_kv_on_npu():
+            raise RuntimeError(
+                f"Request #{req.id} PD handoff requires NPU-resident source KV.")
+        if any(item.request.id == req.id for item in self.pending_pd_handoffs):
+            raise ValueError(f"Request #{req.id} already has a pending PD handoff.")
+        self.pending_pd_handoffs.append(PendingPDHandoff(
+            request=req,
+            source_scheduler=source_scheduler,
+            submit_time_ns=submit_time_ns,
+        ))
+
+    def _commit_pd_handoff(self, handoff, current):
+        """Atomically transfer live-KV capacity and ownership to this instance."""
+        req = handoff.request
+        source = handoff.source_scheduler
+        source_size = source.memory.get_total_kv(req)
+        destination_size = self.memory.get_total_kv(req)
+        self.memory.reserve_live_kv(destination_size, Device.NPU)
+        destination_committed = False
+        source_released = False
+        owner_transferred = False
+        try:
+            self.memory.commit_live_kv_reservation(destination_size, Device.NPU)
+            destination_committed = True
+            source.memory.free(source_size, Device.NPU)
+            source_released = True
+            req.transfer_kv_owner(source.instance_id, self.instance_id)
+            owner_transferred = True
+            bisect.insort(self.request, req, key=lambda item: (item.arrival, item.id))
+            self.pending_pd_handoffs.pop(0)
+        except Exception:
+            self.request = [item for item in self.request if item is not req]
+            if owner_transferred:
+                req.transfer_kv_owner(self.instance_id, source.instance_id)
+            if source_released:
+                source.memory.allocate(source_size, Device.NPU)
+            if destination_committed:
+                self.memory.free(destination_size, Device.NPU)
+            else:
+                self.memory.cancel_live_kv_reservation(destination_size, Device.NPU)
+            raise
+
+        stats = self._get_kv_offload_stats()
+        stats.pd_handoff_count += 1
+        stats.pd_handoff_bytes += destination_size * self.num_npus
+        stats.pd_handoff_wait_ns += max(0, current - handoff.submit_time_ns)
+        source._record_kv_occupancy()
+        self._record_kv_occupancy()
+        self.logger.info(
+            "Admitted PD handoff for request #%d from instance %d, %.2fMB per rank",
+            req.id, source.instance_id, destination_size / MB_TO_BYTE)
+
+    def _admit_pending_pd_handoff(self, current, sys):
+        """Admit one handoff or submit the eviction needed to make it fit."""
+        if not self.pending_pd_handoffs or self.inflight:
+            return None
+        handoff = self.pending_pd_handoffs[0]
+        handoff_size = self.memory.get_total_kv(handoff.request)
+        projected = self.memory.npu_used + self.memory.npu_reserved + handoff_size
+        high_limit = self.memory.npu_mem * self.kv_offload_high_watermark
+        low_limit = self.memory.npu_mem * self.kv_offload_low_watermark
+
+        selected_victims = []
+        if self.enable_kv_offloading and projected > high_limit:
+            candidates = [
+                req for req in self.request
+                if (req.arrival <= current and not req.is_prefill() and
+                    req.is_kv_on_npu())
+            ]
+            cpu_available = self._cpu_kv_capacity_with_session_drops()
+            selected_cpu_bytes = 0
+            while projected > low_limit and candidates:
+                victim = self._select_offload_victim(candidates)
+                candidates.remove(victim)
+                victim_size = self.memory.get_evict_kv(victim)
+                victim_cpu_size = victim_size * self.num_npus
+                if victim_size <= 0:
+                    continue
+                if selected_cpu_bytes + victim_cpu_size > cpu_available:
+                    continue
+                selected_victims.append(victim)
+                selected_cpu_bytes += victim_cpu_size
+                projected -= victim_size
+
+        if selected_victims:
+            return self._start_kv_eviction(selected_victims, current, sys)
+
+        if not self.memory.is_avail(handoff_size, Device.NPU):
+            return None
+
+        self._commit_pd_handoff(handoff, current)
+        return None
+
+    def _park_completed_session_kv(self, req, completion_time_ns):
+        """Transfer a completed non-terminal turn's allocation to its session."""
+        if not self.enable_session_kv_retention:
+            raise RuntimeError("Session KV retention is not enabled.")
+        if self.pd_type == "prefill":
+            raise RuntimeError(
+                "A PD prefill instance cannot park completed session KV.")
+        if req.session_id in self.session_kv_states:
+            raise RuntimeError(
+                f"Session {req.session_id} already owns a parked KV state.")
+        bytes_per_rank = self.memory.get_evict_kv(req)
+        ttl_ns = (
+            req.session_kv_ttl_ns
+            if req.session_kv_ttl_ns is not None
+            else self.session_kv_ttl_ns
+        )
+        expires_at_ns = None
+        if ttl_ns is not None and ttl_ns > 0:
+            expires_at_ns = completion_time_ns + ttl_ns
+        req.transfer_kv_to_session()
+        state = SessionKVState(
+            session_id=req.session_id,
+            model_name=req.model,
+            sub_request_index=req.sub_request_index,
+            source_request_id=req.id,
+            cached_tokens=req.num_computed_tokens,
+            bytes_per_rank=bytes_per_rank,
+            bytes_full_cluster=bytes_per_rank * self.num_npus,
+            residency=req.kv_residency,
+            owner_node_id=self.node_id,
+            owner_instance_id=self.instance_id,
+            num_npus=self.num_npus,
+            tp_size=self.tp_size,
+            block_size=self.memory.block_size,
+            kv_fp=self.memory.kv_fp,
+            parked_at_ns=completion_time_ns,
+            expires_at_ns=expires_at_ns,
+            last_access_ns=completion_time_ns,
+            residency_since_ns=completion_time_ns,
+            mandatory_cpu_offload=self.pd_type == "decode",
+        )
+        self.session_kv_states[req.session_id] = state
+        self._record_session_occupancy()
+        self._record_kv_occupancy()
+        return state
+
+    def _claim_parked_session_kv(self, req):
+        """Claim a compatible colocated NPU state for suffix-only prefill."""
+        state = self.session_kv_states.get(req.session_id)
+        if state is None:
+            return 0
+        if state.invalidated:
+            return 0
+        if (state.expires_at_ns is not None and
+                req.arrival >= state.expires_at_ns):
+            self._release_session_kv(
+                req.session_id, req.arrival, reason="ttl")
+            return 0
+        expected_index = state.sub_request_index + 1
+        if req.sub_request_index != expected_index:
+            raise ValueError(
+                f"Session {req.session_id} expected turn {expected_index}, "
+                f"got {req.sub_request_index}.")
+        pd_cpu_claim = (
+            self.pd_type == "prefill" and
+            state.residency is KVResidency.CPU and
+            state.owner_node_id == self.node_id
+        )
+        layout_compatible = (
+            (state.num_npus == self.num_npus and
+             state.tp_size == self.tp_size) or
+            pd_cpu_claim
+        )
+        compatible = (
+            state.model_name == req.model and
+            state.owner_node_id == self.node_id and
+            state.owner_instance_id == self.instance_id and
+            layout_compatible and
+            state.block_size == self.memory.block_size and
+            state.kv_fp == self.memory.kv_fp and
+            state.residency in {
+                KVResidency.NPU,
+                KVResidency.CPU,
+                KVResidency.NPU_TO_CPU,
+            }
+        )
+        if not compatible:
+            self._release_session_kv(req.session_id, req.arrival)
+            return 0
+
+        if req.reused_prefix_toks is not None:
+            reused_tokens = req.reused_prefix_toks
+        elif req.reuse_previous_kv:
+            reused_tokens = min(state.cached_tokens, req.original_input)
+        else:
+            reused_tokens = 0
+        if reused_tokens > state.cached_tokens:
+            raise ValueError(
+                f"Session {req.session_id} requests {reused_tokens} reused "
+                f"tokens but only {state.cached_tokens} are retained.")
+        if reused_tokens == 0:
+            self._release_session_kv(req.session_id, req.arrival)
+            return 0
+
+        num_blocks = (
+            reused_tokens + self.memory.block_size - 1
+        ) // self.memory.block_size
+        claimed_bytes = self.memory.get_kv(
+            num_blocks * self.memory.block_size)
+        claim_full_cluster = claimed_bytes * self.num_npus
+        if ((not pd_cpu_claim and claimed_bytes > state.bytes_per_rank) or
+                (pd_cpu_claim and
+                 claim_full_cluster > state.bytes_full_cluster)):
+            raise RuntimeError(
+                f"Session {req.session_id} claim exceeds retained allocation: "
+                f"{claim_full_cluster} > {state.bytes_full_cluster} "
+                "full-cluster bytes.")
+        req.num_computed_tokens = reused_tokens
+        req.prefix_cache_hit = reused_tokens
+        req.session_kv_hit_tokens = reused_tokens
+        if state.residency in {
+                KVResidency.CPU, KVResidency.NPU_TO_CPU}:
+            req.pending_session_kv = True
+            req.pending_session_kv_bytes_per_rank = claimed_bytes
+            req.session_kv_hit_tier = "CPU_PENDING"
+            return reused_tokens
+
+        excess_bytes = state.bytes_per_rank - claimed_bytes
+        if excess_bytes:
+            self.memory.free(excess_bytes, Device.NPU)
+        self.session_kv_states.pop(req.session_id)
+        self._account_session_residency(state, req.arrival)
+        req.session_kv_hit_tier = "NPU"
+        self._record_session_occupancy()
+        self._record_kv_occupancy()
+        return reused_tokens
+
+    def _account_session_residency(self, state, current_time_ns):
+        duration_ns = max(0, current_time_ns - state.residency_since_ns)
+        stats = self._get_kv_offload_stats()
+        if state.residency is KVResidency.NPU:
+            stats.session_parked_npu_byte_ns += (
+                state.bytes_per_rank * duration_ns)
+        elif state.residency is KVResidency.CPU:
+            stats.session_parked_cpu_byte_ns += (
+                state.bytes_full_cluster * duration_ns)
+        state.residency_since_ns = current_time_ns
+
+    def _record_session_occupancy(self):
+        stats = self._get_kv_offload_stats()
+        if not hasattr(self, "session_kv_states"):
+            stats.session_current_parked = 0
+            return
+        npu_bytes = sum(
+            state.bytes_per_rank for state in self.session_kv_states.values()
+            if state.residency is KVResidency.NPU and not state.invalidated)
+        cpu_bytes = sum(
+            state.bytes_full_cluster for state in self.session_kv_states.values()
+            if state.residency is KVResidency.CPU and not state.invalidated)
+        stats.session_peak_parked_npu_bytes_per_rank = max(
+            stats.session_peak_parked_npu_bytes_per_rank, npu_bytes)
+        stats.session_peak_parked_cpu_bytes = max(
+            stats.session_peak_parked_cpu_bytes, cpu_bytes)
+        stats.session_current_parked = sum(
+            not state.invalidated
+            for state in self.session_kv_states.values())
+
+    def _release_session_kv(self, session_id, current_time_ns=None, reason=None):
+        """Drop one parked state and release its currently owned allocation."""
+        state = self.session_kv_states.get(session_id)
+        if state is None:
+            return None
+        if state.residency not in {KVResidency.NPU, KVResidency.CPU}:
+            raise RuntimeError(
+                f"Cannot release migrating session {session_id} before its "
+                "transfer completes.")
+        self.session_kv_states.pop(session_id)
+        if current_time_ns is None:
+            current_time_ns = state.last_access_ns
+        self._account_session_residency(state, current_time_ns)
+        if state.residency is KVResidency.NPU:
+            self.memory.free(state.bytes_per_rank, Device.NPU)
+        elif state.residency is KVResidency.CPU:
+            if self.memory.cpu_kv_pool is not None:
+                self.memory.cpu_kv_pool.unregister_parked_session(
+                    self, session_id)
+            self.memory.free(state.bytes_full_cluster, Device.CPU)
+        stats = self._get_kv_offload_stats()
+        if reason == "ttl":
+            stats.session_ttl_expiration_count += 1
+            if state.residency is KVResidency.NPU:
+                stats.session_ttl_npu_bytes_freed += state.bytes_per_rank
+            else:
+                stats.session_ttl_cpu_bytes_freed += state.bytes_full_cluster
+        elif reason == "capacity":
+            stats.session_capacity_drop_count += 1
+            stats.session_capacity_drop_bytes += state.bytes_full_cluster
+        self._record_session_occupancy()
+        self._record_kv_occupancy()
+        return state
+
+    def _drop_cpu_session_for_capacity(self, session_id, current_time_ns):
+        state = self.session_kv_states.get(session_id)
+        if state is None or state.residency is not KVResidency.CPU:
+            return 0
+        bytes_freed = state.bytes_full_cluster
+        self._reset_pending_session_claim(session_id)
+        self._release_session_kv(
+            session_id, current_time_ns, reason="capacity")
+        return bytes_freed
+
+    def _adopt_pd_cpu_session(self, session_id):
+        """Move a node-shared CPU session record from decode to prefill."""
+        if self.pd_type != "prefill" or self.memory.cpu_kv_pool is None:
+            return None
+        record = self.memory.cpu_kv_pool.find_parked_session(session_id)
+        if record is None:
+            return None
+        source, state = record
+        if source is self:
+            return state
+        if (source.node_id != self.node_id or source.pd_type != "decode" or
+                state.residency is not KVResidency.CPU):
+            return None
+        if session_id in self.session_kv_states:
+            raise RuntimeError(
+                f"Prefill instance {self.instance_id} already owns session "
+                f"{session_id}.")
+        source.session_kv_states.pop(session_id)
+        self.memory.cpu_kv_pool.unregister_parked_session(
+            source, session_id)
+        state.owner_instance_id = self.instance_id
+        self.session_kv_states[session_id] = state
+        self.memory.cpu_kv_pool.register_parked_session(self, state)
+        source._record_session_occupancy()
+        self._record_session_occupancy()
+        return state
+
+    def get_next_session_kv_expiry(self):
+        """Return the earliest live parked-state expiry, if any."""
+        expiries = [
+            state.expires_at_ns
+            for state in self.session_kv_states.values()
+            if not state.invalidated and state.expires_at_ns is not None
+        ]
+        return min(expiries) if expiries else None
+
+    def _reset_pending_session_claim(self, session_id):
+        """Convert a queued or reloading continuation into a full miss."""
+        candidates = list(self.request)
+        for batch in self.inflight:
+            candidates.extend(batch.requests)
+        seen = set()
+        for req in candidates:
+            if req.id in seen:
+                continue
+            seen.add(req.id)
+            if req.session_id != session_id or not req.pending_session_kv:
+                continue
+            self._record_session_miss(req)
+            req.pending_session_kv = False
+            req.pending_session_kv_bytes_per_rank = 0
+            req.num_computed_tokens = 0
+            req.prefix_cache_hit = 0
+            req.session_kv_hit_tokens = 0
+            req.session_kv_hit_tier = None
+
+    @staticmethod
+    def _is_session_reuse_attempt(req):
+        return (
+            req.session_id is not None and
+            (req.sub_request_index or 0) > 0 and
+            (req.reuse_previous_kv or req.reused_prefix_toks is not None)
+        )
+
+    def _record_session_hit(self, req, tier):
+        """Commit one usable session-cache hit to the aggregate metrics."""
+        if req.session_kv_outcome_recorded:
+            return
+        if not self._is_session_reuse_attempt(req):
+            return
+        if req.session_kv_hit_tokens <= 0:
+            raise RuntimeError(
+                f"Session hit for request #{req.id} has no reused tokens.")
+        stats = self._get_kv_offload_stats()
+        if tier == "NPU":
+            stats.session_npu_hit_count += 1
+            stats.session_npu_hit_tokens += req.session_kv_hit_tokens
+        elif tier == "CPU":
+            stats.session_cpu_hit_count += 1
+            stats.session_cpu_hit_tokens += req.session_kv_hit_tokens
+        else:
+            raise ValueError(f"Unknown session KV hit tier '{tier}'.")
+        req.session_kv_outcome_recorded = True
+
+    def _record_session_miss(self, req):
+        """Commit one full-prefill fallback to the aggregate metrics."""
+        if req.session_kv_outcome_recorded:
+            return
+        if not self._is_session_reuse_attempt(req):
+            return
+        stats = self._get_kv_offload_stats()
+        stats.session_miss_count += 1
+        stats.session_recomputed_prompt_tokens += req.original_input
+        req.session_kv_outcome_recorded = True
+
+    def expire_session_kv(self, current_time_ns):
+        """Hard-expire inactive session KV before processing equal-time arrivals."""
+        expired = []
+        for session_id, state in list(self.session_kv_states.items()):
+            if (state.invalidated or state.expires_at_ns is None or
+                    current_time_ns < state.expires_at_ns):
+                continue
+            expired.append(session_id)
+            self._reset_pending_session_claim(session_id)
+            if state.residency in {KVResidency.NPU, KVResidency.CPU}:
+                self._release_session_kv(
+                    session_id, current_time_ns, reason="ttl")
+            else:
+                # The backend migration is synchronous and cannot be
+                # cancelled. Hide the logical cache now; completion releases
+                # both the source and destination without exposing a hit.
+                state.invalidated = True
+                state.expires_at_ns = None
+                stats = self._get_kv_offload_stats()
+                stats.session_ttl_expiration_count += 1
+                if state.residency is KVResidency.NPU_TO_CPU:
+                    stats.session_ttl_npu_bytes_freed += state.bytes_per_rank
+                else:
+                    stats.session_ttl_cpu_bytes_freed += state.bytes_full_cluster
+        self._record_session_occupancy()
+        return expired
+
     def _get_reload_size(self, batch_req, batch_len):
         load_size = 0
         for req in batch_req[:batch_len]:
-            if req.is_kv_on_cpu():
+            if req.pending_session_kv:
+                load_size += req.pending_session_kv_bytes_per_rank
+            elif req.is_kv_on_cpu():
                 load_size += self.memory.get_evict_kv(req)
         return load_size
 
@@ -113,6 +594,26 @@ class Scheduler:
         raise RuntimeError(
             f"Unsupported KV offload victim policy '{self.kv_offload_victim_policy}'. "
             "Supported policies: 'lru', 'largest-kv'.")
+
+    def _select_parked_session_victims(self, projected, target):
+        """Select parked NPU sessions before considering active requests."""
+        candidates = sorted(
+            (state for state in self.session_kv_states.values()
+             if state.residency is KVResidency.NPU),
+            key=lambda state: (state.last_access_ns, state.session_id),
+        )
+        cpu_available = self._cpu_kv_capacity_with_session_drops()
+        selected = []
+        selected_cpu_bytes = 0
+        while projected > target and candidates:
+            state = candidates.pop(0)
+            if (selected_cpu_bytes + state.bytes_full_cluster >
+                    cpu_available):
+                continue
+            selected.append(state)
+            selected_cpu_bytes += state.bytes_full_cluster
+            projected -= state.bytes_per_rank
+        return selected
 
     def _get_kv_offload_stats(self):
         if not hasattr(self, "kv_offload_stats"):
@@ -149,6 +650,18 @@ class Scheduler:
             self.memory.cpu_mem - self.memory.cpu_used - self.memory.cpu_reserved,
         )
 
+    def _ensure_cpu_kv_capacity(self, size, current_time_ns):
+        if self.memory.cpu_kv_pool is not None:
+            self.memory.cpu_kv_pool.drop_parked_sessions_for(
+                size, current_time_ns)
+        return self.memory.is_avail(size, Device.CPU)
+
+    def _cpu_kv_capacity_with_session_drops(self):
+        available = self._cpu_kv_available_bytes()
+        if self.memory.cpu_kv_pool is not None:
+            available += self.memory.cpu_kv_pool.reclaimable_parked_bytes()
+        return available
+
     def _get_migration_id(self):
         self.migration_ids += 1
         return self.migration_ids
@@ -173,7 +686,7 @@ class Scheduler:
             return None
         total_per_rank = sum(size for _, size in sizes)
         total_cpu = total_per_rank * self.num_npus
-        if not self.memory.is_avail(total_cpu, Device.CPU):
+        if not self._ensure_cpu_kv_capacity(total_cpu, current):
             self.logger.warning(
                 "CPU KV capacity prevents eviction; required=%.2fMB",
                 total_cpu / MB_TO_BYTE)
@@ -212,6 +725,64 @@ class Scheduler:
         self.logger.info(
             "Scheduling KV eviction batch #%d for %d request(s), %.2fMB per rank",
             batch.batch_id, len(sizes), total_per_rank / MB_TO_BYTE)
+        return batch
+
+    def _start_session_kv_eviction(self, states, current, sys):
+        """Move parked NPU session state to the shared CPU KV pool."""
+        if not states or self.inflight:
+            return None
+        if len({state.session_id for state in states}) != len(states):
+            raise ValueError(
+                "A session KV eviction plan cannot contain duplicates.")
+        invalid = [
+            state.session_id for state in states
+            if state.residency is not KVResidency.NPU
+        ]
+        if invalid:
+            raise RuntimeError(
+                f"Session KV eviction requires NPU residency: {invalid}")
+        total_per_rank = sum(state.bytes_per_rank for state in states)
+        total_cpu = sum(state.bytes_full_cluster for state in states)
+        if total_per_rank <= 0:
+            return None
+        if not self._ensure_cpu_kv_capacity(total_cpu, current):
+            return None
+
+        migration_id = self._get_migration_id()
+        self.memory.reserve_live_kv(total_cpu, Device.CPU)
+        self._record_kv_occupancy()
+        migrations = []
+        try:
+            for state in states:
+                self._account_session_residency(state, current)
+                state.begin_offload(migration_id)
+                migrations.append(KVMigration(
+                    migration_id=migration_id,
+                    request_id=None,
+                    session_id=state.session_id,
+                    direction=KVMigrationDirection.NPU_TO_CPU,
+                    bytes_per_rank=state.bytes_per_rank,
+                    bytes_full_cluster=state.bytes_full_cluster,
+                    submit_time_ns=current,
+                ))
+            batch = Batch(
+                self.get_batch_id(), self.model, 0, 0, [], [], 0, 0,
+                [], [], [], current, 0, evict=total_per_rank,
+                kind=BatchKind.KV_EVICT, migrations=migrations)
+            batch.fired.append(sys)
+        except Exception:
+            for state in states:
+                if state.migration_id == migration_id:
+                    state.cancel_migration(migration_id)
+            self.memory.cancel_live_kv_reservation(total_cpu, Device.CPU)
+            self._record_kv_occupancy()
+            raise
+
+        self.inflight.append(batch)
+        self.logger.info(
+            "Scheduling parked-session eviction batch #%d for %d "
+            "session(s), %.2fMB per rank",
+            batch.batch_id, len(states), total_per_rank / MB_TO_BYTE)
         return batch
 
     def _start_kv_reload(self, requests, current, sys):
@@ -271,13 +842,62 @@ class Scheduler:
             batch.batch_id, len(sizes), total_per_rank / MB_TO_BYTE)
         return batch
 
+    def _start_session_kv_reload(self, req, current, sys):
+        """Reload one parked CPU session before its continuation computes."""
+        if self.inflight or not req.pending_session_kv:
+            return None
+        state = self.session_kv_states.get(req.session_id)
+        if state is None or state.residency is not KVResidency.CPU:
+            raise RuntimeError(
+                f"Request #{req.id} has no CPU-resident session state.")
+        size_per_rank = req.pending_session_kv_bytes_per_rank
+        if size_per_rank <= 0:
+            raise RuntimeError(
+                f"Request #{req.id} has an invalid session reload size.")
+        if not self.memory.is_avail(size_per_rank, Device.NPU):
+            return None
+
+        migration_id = self._get_migration_id()
+        self.memory.reserve_live_kv(size_per_rank, Device.NPU)
+        self._record_kv_occupancy()
+        try:
+            self._account_session_residency(state, current)
+            state.begin_reload(migration_id)
+            migration = KVMigration(
+                migration_id=migration_id,
+                request_id=req.id,
+                session_id=state.session_id,
+                direction=KVMigrationDirection.CPU_TO_NPU,
+                bytes_per_rank=size_per_rank,
+                bytes_full_cluster=size_per_rank * self.num_npus,
+                submit_time_ns=current,
+            )
+            batch = Batch(
+                self.get_batch_id(), self.model, 0, 0, [], [], 0, 0,
+                [], [], [], current, 0, load=size_per_rank,
+                kind=BatchKind.KV_RELOAD, migrations=[migration])
+            batch.requests.append(req)
+            batch.fired.append(sys)
+        except Exception:
+            if state.migration_id == migration_id:
+                state.cancel_migration(migration_id)
+            self.memory.cancel_live_kv_reservation(
+                size_per_rank, Device.NPU)
+            self._record_kv_occupancy()
+            raise
+
+        self.inflight.append(batch)
+        self.logger.info(
+            "Scheduling session reload batch #%d for session %s, "
+            "%.2fMB per rank",
+            batch.batch_id, state.session_id,
+            size_per_rank / MB_TO_BYTE)
+        return batch
+
     # batch the request scheduling method
     def schedule_base(self, current, sys, batch_id=-1):
         # first NPU to process new batch
         if sys == self.start_npu:
-            # nothing to batch return None
-            if len(self.request) != 0 and self.request[0].arrival > current:
-                return None
             # constraint of inflight batches considering parallelism
             if len(self.inflight) >= self.pp_size:
                 # wait it to be done
@@ -285,6 +905,34 @@ class Scheduler:
             # The correctness-first baseline does not overlap a migration with
             # compute or with another migration.
             if any(batch.kind is not BatchKind.COMPUTE for batch in self.inflight):
+                return None
+
+            mandatory_session_states = [
+                state for state in self.session_kv_states.values()
+                if (state.mandatory_cpu_offload and
+                    state.residency is KVResidency.NPU and
+                    not state.invalidated)
+            ]
+            if mandatory_session_states:
+                migration_batch = self._start_session_kv_eviction(
+                    mandatory_session_states, current, sys)
+                if migration_batch is not None:
+                    return migration_batch
+                # Session KV is optional. If correctness-owned active KV has
+                # consumed the CPU pool, discard the parked decode state and
+                # let the continuation perform full prefill instead of
+                # deadlocking the PD pipeline.
+                for state in mandatory_session_states:
+                    self._release_session_kv(
+                        state.session_id, current, reason="capacity")
+                return None
+
+            handoff_batch = self._admit_pending_pd_handoff(current, sys)
+            if handoff_batch is not None:
+                return handoff_batch
+
+            # nothing to batch return None
+            if len(self.request) != 0 and self.request[0].arrival > current:
                 return None
 
             # scheduling start
@@ -454,6 +1102,16 @@ class Scheduler:
                 full_kv_size + full_load_size
             )
 
+            if self.enable_kv_offloading and projected > admission_limit:
+                parked_victims = self._select_parked_session_victims(
+                    projected, low_watermark_limit)
+                if parked_victims:
+                    migration_batch = self._start_session_kv_eviction(
+                        parked_victims, current, sys)
+                    if migration_batch is not None:
+                        return migration_batch
+                    return None
+
             # Plan victims without mutating memory or request state. Crossing
             # the high watermark triggers eviction toward the low watermark.
             # If a candidate request becomes a victim, remove it from this
@@ -464,7 +1122,7 @@ class Scheduler:
                 background = [req for req in gen_req if req not in batch_req]
                 remaining = [req for req in gen_req if req in batch_req]
                 candidates = background + remaining
-                cpu_available = self._cpu_kv_available_bytes()
+                cpu_available = self._cpu_kv_capacity_with_session_drops()
                 selected_cpu_bytes = 0
                 while projected > low_watermark_limit and candidates:
                     victim = self._select_offload_victim(candidates)
@@ -541,6 +1199,15 @@ class Scheduler:
 
             # Reload is a separate workload. The request stays queued and no
             # model tokens advance until the reload completes.
+            session_reload_requests = [
+                req for req in batch_req if req.pending_session_kv]
+            if session_reload_requests:
+                migration_batch = self._start_session_kv_reload(
+                    session_reload_requests[0], current, sys)
+                if migration_batch is not None:
+                    return migration_batch
+                return None
+
             reload_requests = [req for req in batch_req if req.is_kv_on_cpu()]
             if reload_requests:
                 migration_batch = self._start_kv_reload(reload_requests, current, sys)
@@ -993,7 +1660,13 @@ class Scheduler:
             # add to done system
             batch.end.append(sys)
             # check all npus are done
-            if self.pd_type != "prefill":
+            if batch.kind is not BatchKind.COMPUTE:
+                end_npu = self.start_npu + self.num_npus - 1
+                if self.pd_type == "prefill":
+                    end_npu = self.start_npu + self.num_npus * 2 - 1
+                if self.start_npu not in batch.end or end_npu not in batch.end:
+                    return prompt_t, gen_t, end_reqs
+            elif self.pd_type != "prefill":
                 if self.start_npu not in batch.end or (self.start_npu + self.num_npus - 1) not in batch.end:
                     return prompt_t, gen_t, end_reqs
             else:
@@ -1006,6 +1679,14 @@ class Scheduler:
 
         if batch.kind in {BatchKind.KV_EVICT, BatchKind.KV_RELOAD}:
             requests_by_id = {req.id: req for req in batch.requests}
+            request_migrations = [
+                migration for migration in batch.migrations
+                if migration.session_id is None
+            ]
+            session_migrations = [
+                migration for migration in batch.migrations
+                if migration.session_id is not None
+            ]
             stats = self._get_kv_offload_stats()
             duration_ns = max(0, finish - batch.batch_time)
             stats.migration_time_ns += duration_ns
@@ -1014,27 +1695,78 @@ class Scheduler:
                 total_per_rank = sum(m.bytes_per_rank for m in batch.migrations)
                 self.memory.commit_live_kv_reservation(total_cpu, Device.CPU)
                 self.memory.free(total_per_rank, Device.NPU)
-                for migration in batch.migrations:
+                for migration in request_migrations:
                     requests_by_id[migration.request_id].complete_kv_offload(
                         migration.migration_id)
-                stats.preemption_count += len(batch.migrations)
+                for migration in session_migrations:
+                    state = self.session_kv_states[migration.session_id]
+                    state.complete_offload(migration.migration_id)
+                    if state.invalidated:
+                        self.memory.free(
+                            state.bytes_full_cluster, Device.CPU)
+                        self.session_kv_states.pop(migration.session_id)
+                    else:
+                        state.residency_since_ns = finish
+                        if self.memory.cpu_kv_pool is not None:
+                            self.memory.cpu_kv_pool.register_parked_session(
+                                self, state)
+                stats.preemption_count += len(request_migrations)
                 stats.evict_bytes += total_cpu
                 stats.eviction_batches += 1
                 stats.eviction_time_ns += duration_ns
             else:
                 total_per_rank = sum(m.bytes_per_rank for m in batch.migrations)
-                total_cpu = sum(m.bytes_full_cluster for m in batch.migrations)
+                request_cpu = sum(
+                    migration.bytes_full_cluster
+                    for migration in request_migrations)
+                session_cpu = sum(
+                    self.session_kv_states[
+                        migration.session_id].bytes_full_cluster
+                    for migration in session_migrations)
+                total_cpu = request_cpu + session_cpu
                 self.memory.commit_live_kv_reservation(total_per_rank, Device.NPU)
                 self.memory.free(total_cpu, Device.CPU)
-                for migration in batch.migrations:
+                for migration in request_migrations:
                     requests_by_id[migration.request_id].complete_kv_reload(
                         migration.migration_id)
-                stats.reload_bytes += total_cpu
+                for migration in session_migrations:
+                    state = self.session_kv_states[migration.session_id]
+                    if self.memory.cpu_kv_pool is not None:
+                        self.memory.cpu_kv_pool.unregister_parked_session(
+                            self, migration.session_id)
+                    state.complete_reload(
+                        migration.migration_id, migration.bytes_per_rank)
+                    req = requests_by_id[migration.request_id]
+                    self.session_kv_states.pop(migration.session_id)
+                    req.pending_session_kv = False
+                    req.pending_session_kv_bytes_per_rank = 0
+                    req.kv_residency = KVResidency.NPU
+                    if state.invalidated:
+                        self._record_session_miss(req)
+                        self.memory.free(
+                            migration.bytes_per_rank, Device.NPU)
+                        req.num_computed_tokens = 0
+                        req.prefix_cache_hit = 0
+                        req.session_kv_hit_tokens = 0
+                        req.session_kv_hit_tier = None
+                    else:
+                        state.cached_tokens = req.num_computed_tokens
+                        req.session_kv_hit_tier = "CPU"
+                        self._record_session_hit(req, "CPU")
+                        stats.session_cpu_reload_bytes += (
+                            migration.bytes_full_cluster)
+                        stats.session_cpu_reload_time_ns += duration_ns
+                        stats.session_reload_wait_ns += max(
+                            0, finish - req.arrival)
+                stats.reload_bytes += sum(
+                    migration.bytes_full_cluster
+                    for migration in batch.migrations)
                 stats.reload_batches += 1
                 stats.reload_stall_count += len(batch.migrations)
                 stats.reload_stall_ns += duration_ns * len(batch.migrations)
                 stats.reload_time_ns += duration_ns
             self._record_kv_occupancy()
+            self._record_session_occupancy()
             del self.inflight[idx]
             return prompt_t, gen_t, end_reqs
 
@@ -1072,12 +1804,18 @@ class Scheduler:
                         # Prefill instance: send to decode instance
                         self.logger.info("Request #%d is prefill done", req.id)
                         self.logger.info("Request #%d is sent to decode instance", req.id)
-                        # req.num_computed_tokens += 1  # First decode token was generated
+                        # The final prefill token passes through lm_head and
+                        # produces the first output token, just as in the
+                        # colocated path below. The token is implicit in
+                        # num_computed_tokens but must be counted in throughput.
+                        gen_t += 1
                         
-                        # remove kv cache here
+                        # In the offload-aware same-node PD path, source KV
+                        # remains owned by this instance until the decode
+                        # scheduler reserves and commits destination capacity.
                         if self.enable_prefix_caching:
                             self.memory.unlock_prefix(req, Device.NPU)
-                        else:
+                        elif not self.enable_kv_offloading:
                             kv_size = self.memory.get_evict_kv(req)
                             self.memory.free(kv_size, Device.NPU)
 
@@ -1131,9 +1869,28 @@ class Scheduler:
                     self.memory.cache_finished_req(req, Device.NPU) # insert happens here
                     if self.prefix_storage is not None:
                         self.memory.cache_finished_req(req, Device.CPU)
+                elif (self.enable_session_kv_retention and
+                        req.session_id is not None and
+                        req.retain_session_kv):
+                    self._park_completed_session_kv(req, finish)
                 else:
+                    terminal_cleanup_bytes = 0
+                    if (self.enable_session_kv_retention and
+                            req.session_id is not None):
+                        stale = self._release_session_kv(
+                            req.session_id, finish, reason="terminal")
+                        if stale is not None:
+                            terminal_cleanup_bytes += stale.bytes_full_cluster
                     kv_size = self.memory.get_evict_kv(req)
                     self.memory.free(kv_size, Device.NPU)
+                    if (self.enable_session_kv_retention and
+                            req.session_id is not None and
+                            not req.session_has_next):
+                        stats = self._get_kv_offload_stats()
+                        stats.session_terminal_cleanup_count += 1
+                        stats.session_terminal_cleanup_bytes += (
+                            terminal_cleanup_bytes +
+                            kv_size * self.num_npus)
                 req.add_latency(finish)
                 self.done.append(req)
                 end_reqs.append(req)
@@ -1166,18 +1923,35 @@ class Scheduler:
         return self.batch_ids
 
     # add a request
-    def add_request(self, req, is_init=True):
-        new_req = Request(*(req), is_init=is_init)
+    def add_request(self, req, is_init=True, session_metadata=None):
+        session_metadata = session_metadata or {}
+        new_req = Request(*(req), is_init=is_init, **session_metadata)
+        session_hit_tokens = 0
+        if (self.enable_session_kv_retention and
+                new_req.session_id is not None and
+                new_req.session_id not in self.session_kv_states):
+            self._adopt_pd_cpu_session(new_req.session_id)
+        if (self.enable_session_kv_retention and
+                new_req.session_id in self.session_kv_states):
+            session_hit_tokens = self._claim_parked_session_kv(new_req)
+        if (self.enable_session_kv_retention and
+                self._is_session_reuse_attempt(new_req)):
+            if session_hit_tokens:
+                if new_req.session_kv_hit_tier == "NPU":
+                    self._record_session_hit(new_req, "NPU")
+                # CPU claims remain provisional until H2D completion.
+            else:
+                self._record_session_miss(new_req)
         # Maintain arrival-time sort order (required by schedule_base/schedule_with_prefix)
         bisect.insort(self.request, new_req, key=lambda r: (r.arrival, r.id))
-        return
+        return new_req
     
     # add decode request to decode instance from prefill instnace
     def add_decode(self, req):
-        req.instance_id = self.instance_id
-        req.mark_kv_on_npu()
-        self.request.append(req)
+        source_instance_id = req.kv_owner_instance_id
         if self.enable_prefix_caching:
+            req.transfer_kv_owner(source_instance_id, self.instance_id)
+            self.request.append(req)
             self.memory.prefix_match(req)
             kv_size = self.memory.get_evict_kv(req)
             evict_size = max(0, kv_size - self.memory.avail_size(Device.NPU))
@@ -1187,6 +1961,8 @@ class Scheduler:
         else:
             kv_size = self.memory.get_total_kv(req)
             self.memory.allocate(kv_size, Device.NPU)
+            req.transfer_kv_owner(source_instance_id, self.instance_id)
+            bisect.insort(self.request, req, key=lambda item: (item.arrival, item.id))
     
     # get first request's arrival time
     def get_first_arrival_time(self):
@@ -1233,7 +2009,8 @@ class Scheduler:
                 print_markup(f"No {title.split()[0]} data available")
                 return
             mean = np.mean(values) / 1_000_000
-            median = np.median(values) / 1_000_000
+            p50 = np.percentile(values, 50) / 1_000_000
+            p95 = np.percentile(values, 95) / 1_000_000
             p99 = np.percentile(values, 99) / 1_000_000
             label = title.split()[-1] if title != "Time to First Token" else "TTFT"
             # Map to the metric short-name used in the detail rows.
@@ -1244,7 +2021,8 @@ class Scheduler:
             }[title]
             spacing = " " * num_space
             print_markup(f"Mean {short} (ms){spacing}:                                                     {mean:.2f}")
-            print_markup(f"Median {short} (ms){spacing}:                                                   {median:.2f}")
+            print_markup(f"P50 {short} (ms){spacing}:                                                      {p50:.2f}")
+            print_markup(f"P95 {short} (ms){spacing}:                                                      {p95:.2f}")
             print_markup(f"P99 {short} (ms){spacing}:                                                      {p99:.2f}")
 
         _render("Time to First Token", ttft_values)
@@ -1270,6 +2048,25 @@ class Scheduler:
                 "peak CPU used/reserved: "
                 f"{stats['cpu_peak_used_bytes'] / MB_TO_BYTE:.2f}/"
                 f"{stats['cpu_peak_reserved_bytes'] / MB_TO_BYTE:.2f} MB")
+            if stats['pd_handoff_count']:
+                print_markup(
+                    f"PD handoffs: {stats['pd_handoff_count']}, "
+                    f"bytes: {stats['pd_handoff_bytes'] / MB_TO_BYTE:.2f} MB, "
+                    f"admission wait: "
+                    f"{stats['pd_handoff_wait_ns'] / 1_000_000:.3f} ms")
+        if self.enable_session_kv_retention:
+            stats = self.get_kv_offload_stats()
+            print_rule("[sim.tagline]Session KV Retention[/]")
+            print_markup(
+                "NPU/CPU hits: "
+                f"{stats['session_npu_hit_count']}/"
+                f"{stats['session_cpu_hit_count']}, misses: "
+                f"{stats['session_miss_count']}")
+            print_markup(
+                "TTL expirations/capacity drops: "
+                f"{stats['session_ttl_expiration_count']}/"
+                f"{stats['session_capacity_drop_count']}, currently parked: "
+                f"{stats['session_current_parked']}")
 
     # print each request results
     def print_request_result(self):
@@ -1281,7 +2078,8 @@ class Scheduler:
 
     # check all the request is done
     def is_request_empty(self):
-        if len(self.request) == 0 and len(self.inflight) == 0:
+        if (len(self.request) == 0 and len(self.inflight) == 0 and
+                len(self.pending_pd_handoffs) == 0):
             return True
         else:
             return False
@@ -1320,6 +2118,77 @@ class Scheduler:
                     req.tpot,
                     req.itl
                 ])
+
+    def save_kv_offload_output(self, output_file, is_append=False):
+        """Write one instance-level row of CPU KV offload metrics."""
+        if not os.path.isabs(output_file):
+            output_file = f'../{output_file}'
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        stats = self.get_kv_offload_stats()
+        columns = [
+            'instance id', 'node id', 'preemption count',
+            'eviction batches', 'reload batches', 'evict bytes',
+            'reload bytes', 'migration time ns', 'eviction time ns',
+            'reload time ns', 'reload stall count', 'reload stall ns',
+            'npu peak used bytes per rank',
+            'npu peak reserved bytes per rank', 'cpu peak used bytes',
+            'cpu peak reserved bytes', 'pd handoff count',
+            'pd handoff bytes', 'pd handoff wait ns',
+            'session npu hit count', 'session npu hit tokens',
+            'session cpu hit count', 'session cpu hit tokens',
+            'session cpu reload bytes', 'session cpu reload time ns',
+            'session miss count', 'session recomputed prompt tokens',
+            'session ttl expiration count',
+            'session ttl npu bytes freed', 'session ttl cpu bytes freed',
+            'session capacity drop count', 'session capacity drop bytes',
+            'session parked npu byte ns', 'session parked cpu byte ns',
+            'session peak parked npu bytes per rank',
+            'session peak parked cpu bytes', 'session reload wait ns',
+            'session current parked', 'session terminal cleanup count',
+            'session terminal cleanup bytes',
+        ]
+        row = [
+            self.instance_id, self.node_id, stats['preemption_count'],
+            stats['eviction_batches'], stats['reload_batches'],
+            stats['evict_bytes'], stats['reload_bytes'],
+            stats['migration_time_ns'], stats['eviction_time_ns'],
+            stats['reload_time_ns'], stats['reload_stall_count'],
+            stats['reload_stall_ns'],
+            stats['npu_peak_used_bytes_per_rank'],
+            stats['npu_peak_reserved_bytes_per_rank'],
+            stats['cpu_peak_used_bytes'], stats['cpu_peak_reserved_bytes'],
+            stats['pd_handoff_count'], stats['pd_handoff_bytes'],
+            stats['pd_handoff_wait_ns'],
+            stats['session_npu_hit_count'],
+            stats['session_npu_hit_tokens'],
+            stats['session_cpu_hit_count'],
+            stats['session_cpu_hit_tokens'],
+            stats['session_cpu_reload_bytes'],
+            stats['session_cpu_reload_time_ns'],
+            stats['session_miss_count'],
+            stats['session_recomputed_prompt_tokens'],
+            stats['session_ttl_expiration_count'],
+            stats['session_ttl_npu_bytes_freed'],
+            stats['session_ttl_cpu_bytes_freed'],
+            stats['session_capacity_drop_count'],
+            stats['session_capacity_drop_bytes'],
+            stats['session_parked_npu_byte_ns'],
+            stats['session_parked_cpu_byte_ns'],
+            stats['session_peak_parked_npu_bytes_per_rank'],
+            stats['session_peak_parked_cpu_bytes'],
+            stats['session_reload_wait_ns'],
+            stats['session_current_parked'],
+            stats['session_terminal_cleanup_count'],
+            stats['session_terminal_cleanup_bytes'],
+        ]
+        mode = 'a' if is_append else 'w'
+        with open(output_file, mode=mode, newline='') as file:
+            writer = csv.writer(file)
+            if not is_append:
+                writer.writerow(columns)
+            writer.writerow(row)
 
 
 def main():

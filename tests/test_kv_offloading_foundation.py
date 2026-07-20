@@ -1,12 +1,20 @@
+import csv
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
+from types import SimpleNamespace
 
 from serving.core.memory_model import Device, MemoryModel, NodeCPUKVPool
 from serving.core.request import Batch, BatchKind, KVResidency, Request
+from serving.core.router import Router
 from serving.core.scheduler import Scheduler
 from serving.core.trace_generator import generate_trace
 from serving.core.config_builder import _host_transfer_config
+from serving.__main__ import (
+    _build_instance_runtime_configs,
+    _kv_offload_output_file,
+    _validate_kv_offload_node_scope,
+)
 
 
 class KVResidencyTest(unittest.TestCase):
@@ -159,6 +167,93 @@ class HostTransferConfigTest(unittest.TestCase):
             })
 
 
+class OffloadNodeScopeTest(unittest.TestCase):
+    def test_rejects_prefix_caching_on_offload_instance(self):
+        args = SimpleNamespace(
+            dtype="bfloat16",
+            kv_cache_dtype="auto",
+            enable_attn_offloading=False,
+            enable_sub_batch_interleaving=False,
+            max_num_seqs=128,
+            max_num_batched_tokens=2048,
+            long_prefill_token_threshold=0,
+            block_size=16,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=True,
+            enable_session_kv_retention=False,
+            session_kv_ttl_ns=0,
+            enable_kv_offloading=True,
+            kv_offload_high_watermark=0.9,
+            kv_offload_low_watermark=0.8,
+            kv_offload_victim_policy="lru",
+            prioritize_prefill=False,
+            enable_local_offloading=False,
+            enable_block_copy=True,
+        )
+        instances = [{
+            "instance_id": 0,
+            "model_name": "meta-llama/Llama-3.1-8B",
+        }]
+
+        with self.assertRaisesRegex(ValueError, "does not support prefix caching"):
+            _build_instance_runtime_configs(
+                instances,
+                args,
+                {"bfloat16": 2},
+            )
+
+    def test_kv_offload_output_path_preserves_extension(self):
+        self.assertEqual(
+            _kv_offload_output_file("outputs/run.csv"),
+            "outputs/run_kv_offload.csv",
+        )
+        self.assertEqual(
+            _kv_offload_output_file("outputs/run"),
+            "outputs/run_kv_offload.csv",
+        )
+
+    def test_rejects_partially_enabled_pd_node(self):
+        instances = [
+            {"node_id": 0, "pd_type": "prefill"},
+            {"node_id": 0, "pd_type": "decode"},
+        ]
+        runtime = [
+            {"enable_kv_offloading": True, "enable_prefix_caching": False},
+            {"enable_kv_offloading": False, "enable_prefix_caching": False},
+        ]
+
+        with self.assertRaises(ValueError):
+            _validate_kv_offload_node_scope(instances, runtime, "None")
+
+    def test_rejects_cpu_prefix_cache_on_offload_node(self):
+        instances = [
+            {"node_id": 0, "pd_type": None},
+            {"node_id": 0, "pd_type": None},
+        ]
+        runtime = [
+            {"enable_kv_offloading": True, "enable_prefix_caching": False},
+            {"enable_kv_offloading": False, "enable_prefix_caching": True},
+        ]
+
+        with self.assertRaises(ValueError):
+            _validate_kv_offload_node_scope(instances, runtime, "CPU")
+
+    def test_returns_only_nodes_with_offloading(self):
+        instances = [
+            {"node_id": 0, "pd_type": None},
+            {"node_id": 1, "pd_type": None},
+        ]
+        runtime = [
+            {"enable_kv_offloading": True, "enable_prefix_caching": False},
+            {"enable_kv_offloading": False, "enable_prefix_caching": True},
+        ]
+
+        self.assertEqual(
+            _validate_kv_offload_node_scope(instances, runtime, "CPU"),
+            {0},
+        )
+
+
 class MigrationBatchTest(unittest.TestCase):
     def test_batch_defaults_to_compute(self):
         batch = Batch(0, "test/model", 0, 0, [], [], 0, 0, [], [], [], 0, 0)
@@ -198,6 +293,8 @@ class MigrationBatchTest(unittest.TestCase):
         scheduler.prioritize_prefill = False
         scheduler.inflight = []
         scheduler.request = []
+        scheduler.pending_pd_handoffs = []
+        scheduler.session_kv_states = {}
         scheduler.batch_ids = -1
         scheduler.migration_ids = -1
         scheduler.memory = memory
@@ -272,6 +369,7 @@ class MigrationBatchTest(unittest.TestCase):
         with TemporaryDirectory() as temp_dir:
             generate_trace(
                 batch, "test-hardware", 1, 1, 1, 1,
+                pd_type="prefill",
                 node_id=3, instance_id=0, inputs_root=temp_dir,
                 kv_offload_cpu=True)
             trace_path = Path(temp_dir) / "trace" / "test-hardware" / "test" / "model" / "instance0_batch4.txt"
@@ -281,6 +379,7 @@ class MigrationBatchTest(unittest.TestCase):
         self.assertIn("REMOTE:3", trace)
         self.assertIn("8192", trace)
         self.assertNotIn("embedding", trace)
+        self.assertTrue(trace.startswith("PREFILL"))
 
     def _pressure_scheduler(self, npu_used, new_kv_size):
         scheduler, pool = self._scheduler()
@@ -454,6 +553,259 @@ class MigrationBatchTest(unittest.TestCase):
         self.assertEqual(next_batch.kind, BatchKind.COMPUTE)
         self.assertEqual([req.id for req in next_batch.requests], [prefill.id])
         self.assertEqual(decode.kv_residency, KVResidency.CPU)
+
+
+class PDHandoffTest(unittest.TestCase):
+    class Logger:
+        def info(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+        def error(self, *args, **kwargs):
+            pass
+
+    def _scheduler(self, instance_id, pd_type, npu_used, pool=None):
+        memory = MemoryModel.__new__(MemoryModel)
+        memory.node_id = 0
+        memory.instance_id = instance_id
+        memory.num_npus = 1
+        memory.npu_mem = 100
+        memory.npu_used = npu_used
+        memory.npu_reserved = 0
+        memory.cpu_mem = 200
+        memory.cpu_used = 0
+        memory.cpu_reserved = 0
+        memory.cpu_kv_pool = pool
+        memory.weight = 0
+        memory.logger = self.Logger()
+        memory.get_total_kv = lambda req: 20
+        memory.get_evict_kv = lambda req: 20
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model = "test/model"
+        scheduler.node_id = 0
+        scheduler.instance_id = instance_id
+        scheduler.num_npus = 1
+        scheduler.start_npu = 0
+        scheduler.pd_type = pd_type
+        scheduler.enable_prefix_caching = False
+        scheduler.enable_kv_offloading = True
+        scheduler.kv_offload_high_watermark = 0.90
+        scheduler.kv_offload_low_watermark = 0.80
+        scheduler.kv_offload_victim_policy = "lru"
+        scheduler.max_num_batched_tokens = 32
+        scheduler.max_num_seqs = 8
+        scheduler.prioritize_prefill = False
+        scheduler.enable_chunked_prefill = True
+        scheduler.long_prefill_token_threshold = 0
+        scheduler.pp_size = 1
+        scheduler.inflight = []
+        scheduler.request = []
+        scheduler.done = []
+        scheduler.pending_pd_handoffs = []
+        scheduler.batch_ids = -1
+        scheduler.migration_ids = -1
+        scheduler.memory = memory
+        scheduler.logger = self.Logger()
+        return scheduler
+
+    def test_direct_handoff_transfers_capacity_and_ownership_without_cpu(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=200)
+        source = self._scheduler(0, "prefill", 60, pool)
+        destination = self._scheduler(1, "decode", 60, pool)
+        request = Request(7, "test/model", 16, 32, 0, source.instance_id)
+        request.num_computed_tokens = 16
+
+        destination.enqueue_pd_handoff(request, source, 100)
+        batch = destination._admit_pending_pd_handoff(150, 0)
+
+        self.assertIsNone(batch)
+        self.assertEqual(source.memory.npu_used, 40)
+        self.assertEqual(destination.memory.npu_used, 80)
+        self.assertEqual(destination.memory.npu_reserved, 0)
+        self.assertEqual(request.instance_id, destination.instance_id)
+        self.assertEqual(request.kv_owner_instance_id, destination.instance_id)
+        self.assertEqual([req.id for req in destination.request], [request.id])
+        self.assertEqual(destination.pending_pd_handoffs, [])
+        self.assertEqual(pool.used, 0)
+        self.assertEqual(pool.reserved, 0)
+        stats = destination.get_kv_offload_stats()
+        self.assertEqual(stats["pd_handoff_count"], 1)
+        self.assertEqual(stats["pd_handoff_bytes"], 20)
+        self.assertEqual(stats["pd_handoff_wait_ns"], 50)
+
+    def test_cross_node_handoff_is_rejected_before_state_changes(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=200)
+        source = self._scheduler(0, "prefill", 60, pool)
+        destination = self._scheduler(1, "decode", 60, pool)
+        destination.node_id = 1
+        request = Request(7, "test/model", 16, 32, 0, source.instance_id)
+        request.num_computed_tokens = 16
+
+        with self.assertRaisesRegex(RuntimeError, "same-node PD handoff only"):
+            destination.enqueue_pd_handoff(request, source, 100)
+
+        self.assertEqual(source.memory.npu_used, 60)
+        self.assertEqual(destination.memory.npu_used, 60)
+        self.assertEqual(request.kv_owner_instance_id, source.instance_id)
+        self.assertEqual(destination.pending_pd_handoffs, [])
+
+    def test_decode_pressure_evicts_before_handoff_commit(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=200)
+        source = self._scheduler(0, "prefill", 60, pool)
+        destination = self._scheduler(1, "decode", 95, pool)
+        source.memory.get_total_kv = lambda req: 10
+        destination.memory.get_total_kv = lambda req: 10
+        victim = Request(1, "test/model", 8, 32, 0, destination.instance_id)
+        victim.num_computed_tokens = 16
+        victim.is_init = False
+        incoming = Request(2, "test/model", 8, 32, 0, source.instance_id)
+        incoming.num_computed_tokens = 16
+        destination.request = [victim]
+        destination.enqueue_pd_handoff(incoming, source, 100)
+
+        eviction = destination._admit_pending_pd_handoff(120, 0)
+
+        self.assertEqual(eviction.kind, BatchKind.KV_EVICT)
+        self.assertEqual(incoming.kv_owner_instance_id, source.instance_id)
+        self.assertEqual(source.memory.npu_used, 60)
+        self.assertEqual(destination.memory.npu_used, 95)
+        self.assertEqual(pool.reserved, 20)
+
+        destination.add_done(eviction.batch_id + 1, 0, 140)
+        destination._admit_pending_pd_handoff(150, 0)
+
+        self.assertEqual(victim.kv_residency, KVResidency.CPU)
+        self.assertEqual(incoming.kv_owner_instance_id, destination.instance_id)
+        self.assertEqual(source.memory.npu_used, 50)
+        self.assertEqual(destination.memory.npu_used, 85)
+        self.assertEqual(pool.used, 20)
+
+    def test_blocked_handoff_keeps_source_and_request_state(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=0)
+        source = self._scheduler(0, "prefill", 60, pool)
+        destination = self._scheduler(1, "decode", 100, pool)
+        source.memory.get_total_kv = lambda req: 10
+        destination.memory.get_total_kv = lambda req: 10
+        victim = Request(1, "test/model", 8, 32, 0, destination.instance_id)
+        victim.num_computed_tokens = 16
+        incoming = Request(2, "test/model", 8, 32, 0, source.instance_id)
+        incoming.num_computed_tokens = 16
+        destination.request = [victim]
+        destination.enqueue_pd_handoff(incoming, source, 100)
+
+        batch = destination._admit_pending_pd_handoff(120, 0)
+
+        self.assertIsNone(batch)
+        self.assertEqual(source.memory.npu_used, 60)
+        self.assertEqual(destination.memory.npu_used, 100)
+        self.assertEqual(destination.memory.npu_reserved, 0)
+        self.assertEqual(incoming.kv_owner_instance_id, source.instance_id)
+        self.assertEqual([item.request.id for item in destination.pending_pd_handoffs], [2])
+        self.assertEqual([req.id for req in destination.request], [1])
+
+    def test_handoff_failure_rolls_back_destination_reservation(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=200)
+        source = self._scheduler(0, "prefill", 5, pool)
+        destination = self._scheduler(1, "decode", 60, pool)
+        source.memory.get_total_kv = lambda req: 10
+        destination.memory.get_total_kv = lambda req: 10
+        incoming = Request(2, "test/model", 8, 32, 0, source.instance_id)
+        incoming.num_computed_tokens = 16
+        destination.enqueue_pd_handoff(incoming, source, 100)
+
+        with self.assertRaises(RuntimeError):
+            destination._admit_pending_pd_handoff(120, 0)
+
+        self.assertEqual(source.memory.npu_used, 5)
+        self.assertEqual(destination.memory.npu_used, 60)
+        self.assertEqual(destination.memory.npu_reserved, 0)
+        self.assertEqual(incoming.kv_owner_instance_id, source.instance_id)
+        self.assertEqual(destination.request, [])
+        self.assertEqual([item.request.id for item in destination.pending_pd_handoffs], [2])
+
+    def test_prefill_completion_retains_source_until_handoff(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=200)
+        source = self._scheduler(0, "prefill", 60, pool)
+        request = Request(7, "test/model", 10, 20, 0, source.instance_id)
+        request.num_computed_tokens = 9
+        request.chunk_len = 1
+        batch = Batch(
+            0, "test/model", 1, 0, [1], [], 1, 0, [1], [9], [],
+            100, 0)
+        batch.requests.append(request)
+        batch.fired.append(0)
+        source.inflight.append(batch)
+
+        source.add_done(1, 0, 120)
+        generated, _, finished = source.add_done(1, 1, 120)
+
+        self.assertEqual(generated, 1)
+        self.assertEqual([req.id for req in finished], [request.id])
+        self.assertEqual(source.memory.npu_used, 60)
+        self.assertEqual(request.kv_owner_instance_id, source.instance_id)
+
+    def test_writes_instance_level_kv_offload_metrics(self):
+        pool = NodeCPUKVPool(node_id=0, capacity=200)
+        scheduler = self._scheduler(1, "decode", 60, pool)
+        scheduler._get_kv_offload_stats().preemption_count = 2
+        scheduler._get_kv_offload_stats().evict_bytes = 40
+        scheduler._get_kv_offload_stats().reload_bytes = 20
+        scheduler._get_kv_offload_stats().pd_handoff_count = 3
+        scheduler._get_kv_offload_stats().pd_handoff_bytes = 60
+        scheduler._get_kv_offload_stats().session_capacity_drop_count = 4
+        scheduler._get_kv_offload_stats().session_capacity_drop_bytes = 80
+        scheduler._get_kv_offload_stats().session_cpu_hit_count = 5
+        scheduler._record_kv_occupancy()
+
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "offload.csv"
+            scheduler.save_kv_offload_output(str(output))
+            with output.open(newline="") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["instance id"], "1")
+        self.assertEqual(rows[0]["preemption count"], "2")
+        self.assertEqual(rows[0]["evict bytes"], "40")
+        self.assertEqual(rows[0]["reload bytes"], "20")
+        self.assertEqual(rows[0]["pd handoff count"], "3")
+        self.assertEqual(rows[0]["pd handoff bytes"], "60")
+        self.assertEqual(rows[0]["session capacity drop count"], "4")
+        self.assertEqual(rows[0]["session capacity drop bytes"], "80")
+        self.assertEqual(rows[0]["session cpu hit count"], "5")
+        self.assertEqual(rows[0]["npu peak used bytes per rank"], "60")
+
+    def test_router_uses_selected_local_decode_object(self):
+        class FakeScheduler:
+            def __init__(self, instance_id, node_id, pd_type):
+                self.instance_id = instance_id
+                self.node_id = node_id
+                self.pd_type = pd_type
+                self.enable_kv_offloading = True
+                self.max_num_seqs = 8
+                self.request = []
+                self.inflight = []
+                self.received = []
+
+            def enqueue_pd_handoff(self, req, source, current):
+                self.received.append((req.id, source.instance_id, current))
+
+        prefill0 = FakeScheduler(0, 0, "prefill")
+        decode0 = FakeScheduler(1, 0, "decode")
+        prefill1 = FakeScheduler(2, 1, "prefill")
+        decode1 = FakeScheduler(3, 1, "decode")
+        router = Router(
+            4, [prefill0, decode0, prefill1, decode1], 0,
+            routing_policy="LOAD", same_node_pd_only=True)
+        request = Request(9, "test/model", 8, 16, 0, prefill1.instance_id)
+
+        router.transfer_prefill_request([request], 123)
+
+        self.assertEqual(decode0.received, [])
+        self.assertEqual(decode1.received, [(9, prefill1.instance_id, 123)])
 
 
 if __name__ == "__main__":

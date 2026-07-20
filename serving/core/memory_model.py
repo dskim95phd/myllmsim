@@ -3,6 +3,7 @@ from .utils import get_config
 from .radix_tree import *
 import logging
 from enum import Enum
+from .request import KVResidency
 
 GB_TO_BYTE = 1024 * 1024 * 1024
 MB_TO_BYTE = 1024 * 1024
@@ -15,11 +16,11 @@ class Device(Enum):
 
 
 class NodeCPUKVPool:
-    """Shared CPU-DRAM capacity for live KV blocks on one simulator node.
+    """Shared CPU-DRAM capacity for retained live KV on one simulator node.
 
-    The pool intentionally models only live request KV. Prefix-cache capacity
-    remains owned by its existing RadixCache implementation so Phase 1 CPU
-    offloading cannot silently mix the two ownership domains.
+    Active requests and parked sessions use this one allocation domain.
+    Generic RadixCache capacity remains separate and cannot be enabled on an
+    offloading node in the current implementation.
     """
 
     def __init__(self, node_id, capacity):
@@ -27,6 +28,55 @@ class NodeCPUKVPool:
         self.capacity = capacity
         self.used = 0
         self.reserved = 0
+        self.parked_sessions = {}
+
+    def register_parked_session(self, scheduler, state):
+        """Register one CPU-resident optional session in the shared pool."""
+        key = (scheduler.instance_id, state.session_id)
+        self.parked_sessions[key] = (scheduler, state)
+
+    def unregister_parked_session(self, scheduler, session_id):
+        self.parked_sessions.pop((scheduler.instance_id, session_id), None)
+
+    def find_parked_session(self, session_id):
+        matches = [
+            record for (_, candidate), record in self.parked_sessions.items()
+            if candidate == session_id
+        ]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Node {self.node_id} has duplicate parked session id "
+                f"{session_id}.")
+        return matches[0] if matches else None
+
+    def drop_parked_sessions_for(self, size, current_time_ns):
+        """Drop LRU optional CPU state until ``size`` bytes can be reserved."""
+        self._validate_non_negative(size)
+        dropped = []
+        candidates = sorted(
+            self.parked_sessions.values(),
+            key=lambda record: (
+                record[1].last_access_ns,
+                record[1].session_id,
+                record[0].instance_id,
+            ),
+        )
+        while not self.is_avail(size) and candidates:
+            scheduler, state = candidates.pop(0)
+            if state.residency is not KVResidency.CPU or state.invalidated:
+                continue
+            freed = scheduler._drop_cpu_session_for_capacity(
+                state.session_id, current_time_ns)
+            if freed:
+                dropped.append((state.session_id, freed))
+        return dropped
+
+    def reclaimable_parked_bytes(self):
+        return sum(
+            state.bytes_full_cluster
+            for _, state in self.parked_sessions.values()
+            if state.residency is KVResidency.CPU and not state.invalidated
+        )
 
     def is_avail(self, size):
         return size >= 0 and self.used + self.reserved + size <= self.capacity

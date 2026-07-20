@@ -381,14 +381,20 @@ them to a CPU request-swap policy.
 - Apply CPU offloading only through the decode scheduler after handoff.
 - Report PD handoff and CPU migration metrics separately.
 
-### Phase 6: Prefix-cache integration
+### Phase 6: Metrics, documentation, and end-to-end validation
 
-- Re-enable prefix caching with independent live-KV and prefix-cache state.
-- Verify that shared prefix references do not alter live-KV ownership.
-- Add CPU prefix-cache demotion only as a separate, opt-in policy.
+- Preserve the per-request CSV and write offload metrics to a separate
+  instance-level sidecar.
+- Report latency percentiles, migrated bytes and time, reload stalls, peak
+  capacity, and PD handoff accounting.
+- Run colocated and same-node PD workloads with and without NPU pressure.
 
-### Phase 7: Advanced experiments
+### Future experiments
 
+- [session-scoped KV retention](./session-kv-retention-plan.md) for paused
+  agentic and human-in-the-loop turns;
+- cross-session prefix-cache integration with an allocator shared by live KV
+  and prefix KV;
 - asynchronous transfer/compute overlap;
 - predictive prefetch;
 - write-through replicas;
@@ -409,7 +415,7 @@ one pressure workload whose total live KV exceeds NPU capacity.
 | PD without pressure | Direct prompt-KV handoff; no CPU traffic solely due to handoff. |
 | PD with decode pressure | Decode instance offloads the combined prompt-plus-decode history; prefill has no live copy after handoff. |
 | PD across nodes | Rejected by the first implementation with a clear configuration error. |
-| Prefix caching enabled | Prefix hits affect compute reuse only; live swap byte accounting remains correct. |
+| Prefix caching enabled on an offload instance, or CPU prefix caching enabled on an offload node | Rejected before simulation; Phase 1 does not expose two independent owners for the same CPU capacity. |
 
 For each run, collect request throughput, TTFT/TPOT p50/p95/p99, preemption
 count, eviction and reload bytes, migration time, NPU/CPU peak occupancy, and
@@ -428,8 +434,8 @@ step. A step is complete only after its focused validation passes.
 | 2. Migration-only eviction/reload workloads | Complete | One D2H followed by one H2D; no tokens advanced by migration batches |
 | 3. Host-link timing in analytical remote memory | Complete | Size and bandwidth scaling; fixed-latency delta; per-node contention |
 | 4. Watermark/LRU policy and atomic admission | Complete | Repeated pressure, no trace-free mutation, no high-watermark deadlock |
-| 5. Same-node PD ownership and decode-pressure handling | Not started | Direct handoff without CPU traffic; decode eviction before constrained handoff |
-| 6. Metrics, documentation, and end-to-end validation | Not started | Full validation matrix and output fields |
+| 5. Same-node PD ownership and decode-pressure handling | Complete | Direct handoff without CPU traffic; decode eviction before constrained handoff |
+| 6. Metrics, documentation, and end-to-end validation | Complete | Full validation matrix and output fields |
 
 ### Progress log
 
@@ -461,3 +467,28 @@ step. A step is complete only after its focused validation passes.
   preserved two-request ASTRA-Sim run completes with nine batches in the order
   compute, evict, three computes, reload, and three computes; it reports one
   preemption and exactly 2 MiB evicted plus 2 MiB reloaded.
+- 2026-07-20: Completed Step 5. Prefill completion now retains source KV until
+  the selected same-node decode scheduler reserves destination capacity and
+  atomically transfers ownership. Decode pressure submits an ordinary D2H
+  victim eviction before committing the handoff; blocked admission leaves the
+  source allocation, owner, destination queue, and reservations unchanged.
+  Local decode routing now uses the selected scheduler object rather than a
+  local index against the global list. Live-KV pools are created only on
+  offloading nodes, and CPU prefix-cache capacity is rejected on those nodes.
+  The focused suite passes 33 tests. A preserved two-request PD run completes
+  with two direct handoffs (4 MiB total), one 2 MiB D2H eviction, and one 2 MiB
+  H2D reload; only the eviction and reload generate CPU migration traces.
+- 2026-07-20: Completed Step 6. PD prefill completion now includes its first
+  generated token in the global throughput counter. Final summaries report
+  TTFT, TPOT, and ITL p50/p95/p99. When `--output` is set, the unchanged
+  per-request CSV is accompanied by an instance-level `*_kv_offload.csv`
+  containing preemptions, migration batches/bytes/time, reload stalls,
+  NPU/CPU used and reserved peaks, and PD handoff count/bytes/wait time. The
+  focused suite passes 37 tests. The final ASTRA-Sim matrix uses two requests
+  with 10 input and 4 output tokens each: colocated capacity-fit reports zero
+  migrations; PD capacity-fit reports two 4 MiB-total direct handoffs and zero
+  CPU traffic; PD pressure reports the same handoffs plus one 2 MiB eviction
+  and one 2 MiB reload. All three runs complete 2 requests and account for all
+  8 generated tokens. Unit cases additionally cover repeated pressure, LRU
+  and largest-KV victim order, exhausted CPU capacity, cross-node rejection,
+  and unsupported prefix-cache combinations.

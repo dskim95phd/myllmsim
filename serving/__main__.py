@@ -83,6 +83,25 @@ def _resolve_output_file(path, run_id):
     return path.replace("{run_id}", run_id)
 
 
+def _kv_offload_output_file(path):
+    """Return the instance-level CPU KV offload sidecar path."""
+    if path is None:
+        return None
+    stem, extension = os.path.splitext(path)
+    return f"{stem}_kv_offload{extension or '.csv'}"
+
+
+def _next_idle_event(router, schedulers):
+    """Return the earliest request-arrival or parked-session-expiry event."""
+    events = [router.get_next_pending_arrival()]
+    events.extend(
+        scheduler.get_next_session_kv_expiry()
+        for scheduler in schedulers
+    )
+    events = [event for event in events if event is not None]
+    return min(events) if events else None
+
+
 def _cleanup_inputs_root(run_paths, logger):
     """Remove generated ASTRA-Sim inputs after a completed simulation."""
     runs_root = os.path.abspath(os.path.join("inputs", "runs"))
@@ -180,6 +199,11 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 "enable_chunked_prefill", args.enable_chunked_prefill),
             "enable_prefix_caching": instance.get(
                 "enable_prefix_caching", args.enable_prefix_caching),
+            "enable_session_kv_retention": instance.get(
+                "enable_session_kv_retention",
+                args.enable_session_kv_retention),
+            "session_kv_ttl_ns": instance.get(
+                "session_kv_ttl_ns", args.session_kv_ttl_ns),
             "enable_kv_offloading": instance.get(
                 "enable_kv_offloading", args.enable_kv_offloading),
             "kv_offload_high_watermark": instance.get(
@@ -196,6 +220,10 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
         })
         cfg = runtime_configs[-1]
+        if cfg["session_kv_ttl_ns"] < 0:
+            raise ValueError(
+                "Session KV TTL must be non-negative; got "
+                f"{cfg['session_kv_ttl_ns']} for instance {instance_id}.")
         high = cfg["kv_offload_high_watermark"]
         low = cfg["kv_offload_low_watermark"]
         if not 0 < low <= high <= 1:
@@ -211,10 +239,72 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             raise ValueError(
                 "CPU KV offloading Phase 1 does not support prefix caching. "
                 "Use --no-enable-prefix-caching or disable it for the instance.")
+        if (cfg["enable_session_kv_retention"] and
+                cfg["enable_prefix_caching"]):
+            raise ValueError(
+                "Session KV retention does not support generic prefix "
+                "caching. Use --no-enable-prefix-caching or disable it for "
+                "the instance.")
+        if (cfg["enable_session_kv_retention"] and
+                instances[instance_id].get("pd_type") is not None):
+            if not cfg["enable_kv_offloading"]:
+                raise ValueError(
+                    "PD session KV retention requires CPU KV offloading "
+                    "on every PD instance so decode-to-prefill reuse has "
+                    "modeled D2H/H2D transfers.")
         if cfg["enable_kv_offloading"] and cfg["enable_attn_offloading"]:
             raise ValueError(
                 "CPU KV offloading Phase 1 cannot be combined with PIM attention offloading.")
     return runtime_configs
+
+
+def _validate_kv_offload_node_scope(instances, runtime_configs, prefix_storage):
+    """Validate node-shared resources and return nodes using live-KV offload."""
+    offload_nodes = {
+        instances[instance_id]["node_id"]
+        for instance_id, cfg in enumerate(runtime_configs)
+        if cfg["enable_kv_offloading"]
+    }
+    for node_id in offload_nodes:
+        pd_instance_ids = [
+            instance_id for instance_id, instance in enumerate(instances)
+            if (instance["node_id"] == node_id and
+                instance["pd_type"] in {"prefill", "decode"})
+        ]
+        disabled_pd_ids = [
+            instance_id for instance_id in pd_instance_ids
+            if not runtime_configs[instance_id]["enable_kv_offloading"]
+        ]
+        if disabled_pd_ids:
+            raise ValueError(
+                "CPU KV offloading requires every prefill/decode "
+                f"instance on node {node_id} to enable offloading; disabled "
+                f"instances: {disabled_pd_ids}.")
+        session_pd_ids = [
+            instance_id for instance_id in pd_instance_ids
+            if runtime_configs[instance_id]["enable_session_kv_retention"]
+        ]
+        disabled_session_pd_ids = [
+            instance_id for instance_id in pd_instance_ids
+            if not runtime_configs[instance_id]["enable_session_kv_retention"]
+        ]
+        if session_pd_ids and disabled_session_pd_ids:
+            raise ValueError(
+                "PD session KV retention requires every prefill/decode "
+                f"instance on node {node_id} to enable session retention; "
+                f"disabled instances: {disabled_session_pd_ids}.")
+        cpu_prefix_ids = [
+            instance_id for instance_id, instance in enumerate(instances)
+            if (instance["node_id"] == node_id and
+                runtime_configs[instance_id]["enable_prefix_caching"] and
+                prefix_storage == "CPU")
+        ]
+        if cpu_prefix_ids:
+            raise ValueError(
+                "CPU KV offloading cannot share a node with CPU prefix "
+                f"cache capacity; node {node_id}, prefix instances: "
+                f"{cpu_prefix_ids}.")
+    return offload_nodes
 
 
 def main():
@@ -269,6 +359,15 @@ def main():
     parser.add_argument('--enable-prefix-caching', action=argparse.BooleanOptionalAction, default=True,
                         help='enable prefix caching via RadixAttention to reuse KV cache across requests '
                         'with shared prefixes (default: enabled). Use --no-enable-prefix-caching to disable')
+    parser.add_argument('--enable-session-kv-retention',
+                        action=argparse.BooleanOptionalAction, default=False,
+                        help='retain KV between append-only turns of the same '
+                        'agentic session. Supports colocated and '
+                        'same-node PD NPU/CPU hits and requires '
+                        '--no-enable-prefix-caching')
+    parser.add_argument('--session-kv-ttl-ns', type=int, default=0,
+                        help='default hard TTL in ns for inactive retained '
+                        'session KV; 0 disables time-based expiration')
     parser.add_argument('--enable-kv-offloading', action=argparse.BooleanOptionalAction, default=False,
                         help='enable Phase-1 request-level exclusive KV migration between NPU memory and '
                         'the node-shared CPU DRAM pool. Requires --no-enable-prefix-caching')
@@ -338,9 +437,6 @@ def main():
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
     print_banner()
-    print_input_config(args=args)
-    print_markup("[sim.heading]▶ Starting simulation...[/]\n")
-    flush.stdout.flush()
     
     _dtype_to_bits = {'float16': 16, 'bfloat16': 16, 'float32': 32, 'fp8': 8, 'int8': 8}
     request_routing_policy=args.request_routing_policy
@@ -383,6 +479,11 @@ def main():
     pim_models = cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
+    offload_nodes = _validate_kv_offload_node_scope(
+        instances, instance_runtime_configs, prefix_storage)
+    print_input_config(args=args, runtime_configs=instance_runtime_configs)
+    print_markup("[sim.heading]▶ Starting simulation...[/]\n")
+    flush.stdout.flush()
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration
     # If you want to set more specific information such as latency, look at config.py and each json file
@@ -475,10 +576,11 @@ def main():
     # deliberately separate from prefix-cache pools, which are not supported
     # in this phase.
     cpu_kv_pools = {}
-    if any(cfg["enable_kv_offloading"] for cfg in instance_runtime_configs):
+    if offload_nodes:
         prefill_nodes = {
             instance["node_id"] for instance in instances
-            if instance["pd_type"] == "prefill"
+            if (instance["pd_type"] == "prefill" and
+                instance["node_id"] in offload_nodes)
         }
         decode_nodes = {
             instance["node_id"] for instance in instances
@@ -490,8 +592,8 @@ def main():
                 "CPU KV offloading Phase 1 supports only same-node prefill/decode "
                 f"disaggregation; nodes without a decode instance: {missing_decode_nodes}")
         cpu_kv_pools = {
-            node_id: NodeCPUKVPool(node_id, capacity_gb * GB_TO_BYTE)
-            for node_id, capacity_gb in enumerate(cpu_mem_size)
+            node_id: NodeCPUKVPool(node_id, cpu_mem_size[node_id] * GB_TO_BYTE)
+            for node_id in offload_nodes
         }
 
     schedulers = []
@@ -526,6 +628,9 @@ def main():
             kv_offload_low_watermark=inst_cfg["kv_offload_low_watermark"],
             kv_offload_victim_policy=inst_cfg["kv_offload_victim_policy"],
             cpu_kv_pool=cpu_kv_pools.get(instance["node_id"]),
+            enable_session_kv_retention=inst_cfg[
+                "enable_session_kv_retention"],
+            session_kv_ttl_ns=inst_cfg["session_kv_ttl_ns"],
         ))
 
     # Controller for astra-sim process communication
@@ -624,9 +729,10 @@ def main():
             id = out_dict['id']
             current = out_dict['cycle']
 
-        # Route newly arrived requests to instances based on current load
-        if dataset is not None:
-            router.route_arrived_requests(current)
+        # Hard expiry wins when it shares a timestamp with an arrival or a
+        # migration completion.
+        for scheduler in schedulers:
+            scheduler.expire_session_kv(current)
 
         instance_id = npu2inst_mapping[sys]  # get instance id from NPU id
         node_id = inst2node_mapping[instance_id] # get node id from instance id
@@ -661,7 +767,13 @@ def main():
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
-            router.transfer_prefill_request(finished_reqs)
+            router.transfer_prefill_request(finished_reqs, current)
+
+        # Apply batch completion and dependency-chain releases before routing
+        # equal-time arrivals. This lets a zero-think-time PD continuation see
+        # the CPU session record committed by a just-finished D2H migration.
+        if dataset is not None:
+            router.route_arrived_requests(current)
 
         # schedule requests
         new_req = schedulers[instance_id].schedule(current, sys, id)
@@ -1023,10 +1135,11 @@ def main():
             # If all instances are idle but deferred sessions have pending
             # requests with future arrival times (tool calls still running),
             # advance current time so the next iteration can pick them up.
-            if router.has_deferred_sessions() or router.has_pending_requests():
-                next_arrival = router.get_next_pending_arrival()
-                if next_arrival is not None and next_arrival > current:
-                    current = next_arrival
+            next_event = _next_idle_event(router, schedulers)
+            if next_event is not None and next_event > current:
+                current = next_event
+                for scheduler in schedulers:
+                    scheduler.expire_session_kv(current)
             controller.write_flush(p, "pass")
         
         # flush
@@ -1117,6 +1230,19 @@ def main():
         print(f"Saving each request's information to output file: {output_file}")
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
+        offload_schedulers = [
+            schedulers[i] for i, cfg in enumerate(instance_runtime_configs)
+            if (cfg["enable_kv_offloading"] or
+                cfg["enable_session_kv_retention"])
+        ]
+        if offload_schedulers:
+            kv_offload_output = _kv_offload_output_file(output_file)
+            print(
+                "Saving instance-level KV migration/session metrics to output file: "
+                f"{kv_offload_output}")
+            for i, scheduler in enumerate(offload_schedulers):
+                scheduler.save_kv_offload_output(
+                    kv_offload_output, is_append=i != 0)
 
     if args.cleanup_inputs:
         _cleanup_inputs_root(run_paths, logger)

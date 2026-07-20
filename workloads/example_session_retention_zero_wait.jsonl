@@ -1,0 +1,1 @@
+{"session_id":"session-zero-wait","arrival_time_ns":0,"reuse_previous_kv":true,"sub_requests":[{"input_toks":10,"output_toks":4,"tool_duration_ns":0},{"input_toks":15,"output_toks":4,"tool_duration_ns":0}]}

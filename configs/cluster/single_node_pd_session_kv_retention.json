@@ -1,0 +1,50 @@
+{
+  "num_nodes": 1,
+  "link_bw": 16,
+  "link_latency": 20000,
+  "nodes": [
+    {
+      "num_instances": 2,
+      "cpu_mem": {
+        "mem_size": 512,
+        "mem_bw": 256,
+        "mem_latency": 80,
+        "host_link_bw": 64,
+        "host_link_latency": 800,
+        "host_transfer_model": "pipelined"
+      },
+      "instances": [
+        {
+          "model_name": "meta-llama/Llama-3.1-8B",
+          "hardware": "RTXPRO6000",
+          "npu_mem": {
+            "mem_size": 96,
+            "mem_bw": 1597,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "pd_type": "prefill",
+          "enable_prefix_caching": false,
+          "enable_session_kv_retention": true,
+          "enable_kv_offloading": true
+        },
+        {
+          "model_name": "meta-llama/Llama-3.1-8B",
+          "hardware": "RTXPRO6000",
+          "npu_mem": {
+            "mem_size": 96,
+            "mem_bw": 1597,
+            "mem_latency": 0
+          },
+          "num_npus": 1,
+          "tp_size": 1,
+          "pd_type": "decode",
+          "enable_prefix_caching": false,
+          "enable_session_kv_retention": true,
+          "enable_kv_offloading": true
+        }
+      ]
+    }
+  ]
+}

@@ -64,6 +64,8 @@ this dependency chain:
 | `session_id` | string | ✓ | Unique identifier for the session |
 | `arrival_time_ns` | int | ✓ | When the **first** sub-request arrives |
 | `sub_requests` | list&lt;object&gt; | ✓ | Ordered chain of LLM calls. Length ≥ 1 |
+| `reuse_previous_kv` | bool | optional | Assert that each later turn is an append-only continuation and may reuse the previous turn's retained KV |
+| `session_kv_ttl_ns` | int | optional | Per-session non-negative retention lifetime measured from turn completion. `0` disables expiration; omission uses the instance or CLI default |
 
 ### Sub-request fields
 
@@ -74,9 +76,52 @@ this dependency chain:
 | `tool_duration_ns` | int | ✓ | Time to wait **after** this call completes before the next sub-request becomes eligible |
 | `input_tok_ids` | list&lt;int&gt; | optional | Same as flat format |
 | `output_tok_ids` | list&lt;int&gt; | optional | Same as flat format |
+| `reused_prefix_toks` | int | optional | Authoritative number of predecessor KV tokens to reuse for this turn; supports truncation or summarization without token IDs |
 
 The last sub-request typically has `tool_duration_ns: 0` (nothing to
 wait for after the session ends).
+
+### Session KV retention without token IDs
+
+Session retention is separate from generic token-prefix caching. Enable it
+with:
+
+```bash
+python -m serving \
+  --no-enable-prefix-caching \
+  --enable-session-kv-retention \
+  --dataset workloads/my-agentic-session.jsonl
+```
+
+`reuse_previous_kv: true` is a dataset assertion that later inputs extend the
+same session context. The simulator then reuses at most the predecessor's
+actual `num_computed_tokens` and prefills only the suffix. It does not compare
+token IDs and cannot reuse KV from a different `session_id`.
+
+Runnable normal-wait and zero-wait records are provided as
+`workloads/example_session_retention.jsonl` and
+`workloads/example_session_retention_zero_wait.jsonl`. See the
+[agentic-session examples](./agentic-sessions#runnable-session-retention-examples)
+for colocated, TTL, and same-node PD commands.
+
+For a rewritten context, set `reused_prefix_toks` on that sub-request. The
+value must be non-negative and no greater than both the new input length and
+the predecessor's retained token count. A zero value forces a full-prefill
+miss.
+
+In colocated mode, retained state remains on the same instance. Hard TTL
+expiry frees inactive NPU or CPU state even when
+the simulator is otherwise idle. Expiration wins over an arrival at the same
+timestamp. State expiring during D2H or H2D is no longer reusable and is
+physically released when the synchronous transfer completes. With CPU KV
+offloading enabled, a valid parked state may migrate to the node-shared CPU
+pool and must complete an H2D reload before suffix prefill. CPU pressure may
+drop optional parked state, making the later continuation a full-prefill miss.
+
+Same-node PD continuation uses an explicit CPU bridge. A non-terminal decode
+turn performs D2H before parking; the next prefill turn performs H2D before
+suffix prefill. Enable both session retention and CPU KV offloading on every
+prefill/decode instance. Cross-node PD session reuse is unsupported.
 
 ### When to use agentic
 

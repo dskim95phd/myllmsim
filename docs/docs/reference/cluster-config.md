@@ -201,7 +201,9 @@ value still falls back to the model config's `torch_dtype`.
 | `kv_cache_dtype` | string | `--kv-cache-dtype` | KV-cache dtype for memory accounting and profile variant selection |
 | `enable_chunked_prefill` | bool | `--enable-chunked-prefill` | Enable chunked prefill in this instance's scheduler |
 | `enable_prefix_caching` | bool | `--enable-prefix-caching` | Enable this instance's local prefix cache |
-| `enable_kv_offloading` | bool | `--enable-kv-offloading` | Migrate complete live-request KV state between NPU and node-shared CPU DRAM |
+| `enable_session_kv_retention` | bool | `--enable-session-kv-retention` | Retain and reuse NPU or CPU KV between turns of the same agentic session |
+| `session_kv_ttl_ns` | int | `--session-kv-ttl-ns` | Default hard TTL for inactive session KV; `0` disables time-based expiration |
+| `enable_kv_offloading` | bool | `--enable-kv-offloading` | Migrate complete active-request or parked-session KV between NPU and node-shared CPU DRAM |
 | `kv_offload_high_watermark` | float | `--kv-offload-high-watermark` | NPU KV pressure level that triggers eviction |
 | `kv_offload_low_watermark` | float | `--kv-offload-low-watermark` | NPU KV target after eviction; must not exceed the high watermark |
 | `kv_offload_victim_policy` | string | `--kv-offload-victim-policy` | CPU KV victim policy: `lru` (default) or `largest-kv` |
@@ -210,6 +212,27 @@ value still falls back to the model config's `torch_dtype`.
 | `enable_attn_offloading` | bool | `--enable-attn-offloading` | Emit PIM attention offload for this instance |
 | `enable_sub_batch_interleaving` | bool | `--enable-sub-batch-interleaving` | Enable sub-batch interleaving for this instance |
 | `enable_block_copy` | bool | `--enable-block-copy` | Reuse one block trace across repeated transformer blocks |
+
+On a node that combines CPU KV offloading with prefill/decode
+disaggregation, all prefill and decode instances must set
+`enable_kv_offloading: true`. Handoff is restricted to a decode instance on
+the same node. The source prompt KV allocation is released only after the
+decode-side NPU reservation commits. CPU prefix-cache storage cannot share
+that node with live-KV offloading in this implementation phase.
+
+Session KV retention supports colocated and same-node PD instances but
+cannot be combined with generic prefix caching. Active requests and parked
+sessions share one `NodeCPUKVPool`, and D2H/H2D residency changes commit only
+after their modeled host-link workloads finish. Under CPU pressure, LRU parked
+session records are discarded before active-request eviction is rejected.
+`session_kv_ttl_ns` is measured from turn completion; a session-level workload
+value overrides the instance default.
+
+For PD session reuse, every prefill and decode instance on the node must set
+both `enable_session_kv_retention: true` and `enable_kv_offloading: true`.
+Non-terminal decode KV is always parked to node CPU with D2H timing. The next
+turn reloads it from CPU into its affinitized prefill instance before suffix
+prefill. This policy does not support cross-node decode-to-prefill reuse.
 
 ### `placement` (optional)
 

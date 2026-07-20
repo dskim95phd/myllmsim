@@ -1470,14 +1470,10 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
     if batch.kind in {BatchKind.KV_EVICT, BatchKind.KV_RELOAD}:
         if not kv_offload_cpu:
             raise RuntimeError("CPU KV migration batch requires kv_offload_cpu=True.")
-        if pd_type is None:
-            instance_type = 'COLOCATED'
-        elif pd_type == 'prefill':
-            instance_type = 'PREFILL'
-        elif pd_type == 'decode':
-            instance_type = 'DECODE'
-        else:
-            raise ValueError(f"Unknown instance type {pd_type}.")
+        # A prefill migration also emits a synchronization graph for its
+        # paired logical sender system. The actual memory operation remains on
+        # the physical NPU graph and is accounted only once.
+        instance_type = 'PREFILL' if pd_type == 'prefill' else 'COLOCATED'
 
         remote = f"REMOTE:{node_id}"
         if batch.kind is BatchKind.KV_EVICT:

@@ -404,7 +404,7 @@ def print_banner() -> None:
     _console.rule(style="sim.rule")
 
 
-def print_input_config(args: Any) -> None:
+def print_input_config(args: Any, runtime_configs: list[dict[str, Any]] | None = None) -> None:
     """Render the argparse-namespace configuration block used at startup."""
     def _inf0(x: Any) -> Any:
         return x if x not in (0, None) else "inf"
@@ -433,6 +433,22 @@ def print_input_config(args: Any) -> None:
         if hasattr(args, attr):
             items.append((label, conv(getattr(args, attr))))
 
+    def add_feature(attr: str, label: str) -> None:
+        if runtime_configs:
+            values = {bool(config[attr]) for config in runtime_configs}
+            value = _yn(values.pop()) if len(values) == 1 else "MIXED"
+            items.append((label, value))
+        else:
+            add(attr, label, _yn)
+
+    def add_runtime_value(attr: str, label: str) -> None:
+        if runtime_configs:
+            values = [config[attr] for config in runtime_configs]
+            value = values[0] if all(item == values[0] for item in values) else "MIXED"
+            items.append((label, value))
+        else:
+            add(attr, label)
+
     add("cluster_config", "Cluster config", _na)
     add("run_id", "Run ID", _na)
     add("inputs_root", "ASTRA-Sim inputs root", _na)
@@ -445,14 +461,17 @@ def print_input_config(args: Any) -> None:
     add("fp", "FP precision", _bits)
     add("request_routing_policy", "Request routing", _na)
     add("expert_routing_policy", "Expert routing", _na)
-    add("enable_prefix_caching", "Prefix caching", _yn)
-    add("enable_chunked_prefill", "Chunked prefill", _yn)
+    add_feature("enable_prefix_caching", "Prefix caching")
+    add_feature("enable_session_kv_retention", "Session KV retention")
+    add_runtime_value("session_kv_ttl_ns", "Session KV TTL (ns)")
+    add_feature("enable_kv_offloading", "CPU KV offloading")
+    add_feature("enable_chunked_prefill", "Chunked prefill")
     add("prefix_storage", "Prefix caching scheme", _pc)
     add("enable_prefix_sharing", "Centralized prefix caching", _yn)
-    add("enable_attn_offloading", "Offload attention to PIM", _yn)
-    add("enable_sub_batch_interleaving", "Sub-batch interleaving", _yn)
+    add_feature("enable_attn_offloading", "Offload attention to PIM")
+    add_feature("enable_sub_batch_interleaving", "Sub-batch interleaving")
     add("enable_attn_prediction", "Realtime attention prediction", _yn)
-    add("prioritize_prefill", "Prioritize prefill", _yn)
+    add_feature("prioritize_prefill", "Prioritize prefill")
     add("link_bw", "Link bandwidth (GB/s)")
     add("link_latency", "Link latency (ns)")
     add("network_backend", "Network backend", _na)
@@ -470,7 +489,8 @@ def print_input_config(args: Any) -> None:
     _console.print()
     key_pad = max(len(k) for k, _ in items)
     for key, val in items:
-        _console.print(f"  • [cyan]{key:<{key_pad}}[/cyan] : {val}")
+        # Keep startup output encodable on legacy Windows code pages.
+        _console.print(f"  - [cyan]{key:<{key_pad}}[/cyan] : {val}")
     _console.rule(style="sim.rule")
 
 

@@ -83,10 +83,19 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `kv_cache_dtype` | String | No | Per-instance override for `--kv-cache-dtype` |
 | `enable_chunked_prefill` | Boolean | No | Per-instance override for `--enable-chunked-prefill` |
 | `enable_prefix_caching` | Boolean | No | Per-instance override for `--enable-prefix-caching` |
+| `enable_session_kv_retention` | Boolean | No | Retain NPU or CPU KV between append-only turns in colocated or same-node PD mode |
+| `session_kv_ttl_ns` | Integer | No | Default hard TTL for inactive session KV; `0` disables expiration |
 | `enable_kv_offloading` | Boolean | No | Enable request-level live-KV migration to node-shared CPU DRAM |
 | `kv_offload_high_watermark` | Float | No | NPU KV pressure level that triggers eviction (default: 0.90) |
 | `kv_offload_low_watermark` | Float | No | NPU KV target after eviction (default: 0.80) |
 | `kv_offload_victim_policy` | String | No | CPU KV victim policy: `lru` (default) or `largest-kv` |
+
+Bundled session-retention examples:
+
+- `single_node_session_kv_retention.json`: colocated NPU retention and TTL
+  experiments;
+- `single_node_pd_session_kv_retention.json`: same-node prefill/decode CPU
+  bridge with modeled D2H and H2D transfers.
 | `prioritize_prefill` | Boolean | No | Per-instance override for `--prioritize-prefill` |
 | `enable_local_offloading` | Boolean | No | Per-instance override for `--enable-local-offloading` |
 | `enable_attn_offloading` | Boolean | No | Per-instance override for `--enable-attn-offloading` |
@@ -113,6 +122,9 @@ Setting a numeric field to `0` means "unlimited" (via the `_runtime_limit` helpe
 
 **Validation gates:**
 - `enable_sub_batch_interleaving: true` requires `enable_attn_offloading: true` (enforced at config load time)
+- Every prefill/decode instance on a CPU-KV-offloading node must enable KV offloading.
+- CPU prefix-cache storage cannot share a node with CPU live-KV offloading.
+- CPU-KV-aware prefill/decode handoff is restricted to the same node.
 
 **Example: heterogeneous P/D instances**
 

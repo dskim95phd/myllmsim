@@ -26,22 +26,110 @@ class BatchKind(Enum):
 @dataclass(frozen=True)
 class KVMigration:
     migration_id: int
-    request_id: int
+    request_id: int | None
     direction: KVMigrationDirection
     bytes_per_rank: int
     bytes_full_cluster: int
     submit_time_ns: int
+    session_id: str | None = None
+
+
+@dataclass
+class SessionKVState:
+    """KV allocation retained between turns of one linear session."""
+
+    session_id: str
+    model_name: str
+    sub_request_index: int
+    source_request_id: int
+    cached_tokens: int
+    bytes_per_rank: int
+    bytes_full_cluster: int
+    residency: KVResidency
+    owner_node_id: int
+    owner_instance_id: int
+    num_npus: int
+    tp_size: int
+    block_size: int
+    kv_fp: int
+    parked_at_ns: int
+    expires_at_ns: int | None
+    last_access_ns: int
+    migration_id: int | None = None
+    invalidated: bool = False
+    residency_since_ns: int = 0
+    mandatory_cpu_offload: bool = False
+
+    def begin_offload(self, migration_id):
+        if self.residency is not KVResidency.NPU:
+            raise RuntimeError(
+                f"Session {self.session_id} cannot start NPU-to-CPU "
+                f"migration from {self.residency.name}.")
+        self.residency = KVResidency.NPU_TO_CPU
+        self.migration_id = migration_id
+
+    def complete_offload(self, migration_id):
+        self._check_migration(KVResidency.NPU_TO_CPU, migration_id)
+        self.residency = KVResidency.CPU
+        self.migration_id = None
+
+    def begin_reload(self, migration_id):
+        if self.residency is not KVResidency.CPU:
+            raise RuntimeError(
+                f"Session {self.session_id} cannot start CPU-to-NPU "
+                f"migration from {self.residency.name}.")
+        self.residency = KVResidency.CPU_TO_NPU
+        self.migration_id = migration_id
+
+    def complete_reload(self, migration_id, bytes_per_rank):
+        self._check_migration(KVResidency.CPU_TO_NPU, migration_id)
+        self.residency = KVResidency.NPU
+        self.migration_id = None
+        self.bytes_per_rank = bytes_per_rank
+        self.bytes_full_cluster = bytes_per_rank * self.num_npus
+
+    def cancel_migration(self, migration_id):
+        if self.migration_id != migration_id:
+            raise RuntimeError(
+                f"Session {self.session_id} migration id mismatch: expected "
+                f"{self.migration_id}, got {migration_id}.")
+        if self.residency is KVResidency.NPU_TO_CPU:
+            self.residency = KVResidency.NPU
+        elif self.residency is KVResidency.CPU_TO_NPU:
+            self.residency = KVResidency.CPU
+        else:
+            raise RuntimeError(
+                f"Session {self.session_id} is not migrating from "
+                f"{self.residency.name}.")
+        self.migration_id = None
+
+    def _check_migration(self, expected_residency, migration_id):
+        if self.residency is not expected_residency:
+            raise RuntimeError(
+                f"Session {self.session_id} expected "
+                f"{expected_residency.name}, got {self.residency.name}.")
+        if self.migration_id != migration_id:
+            raise RuntimeError(
+                f"Session {self.session_id} migration id mismatch: expected "
+                f"{self.migration_id}, got {migration_id}.")
 
 
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(
+            self, id, model, input, output, arrival, instance_id,
+            input_hash_ids=None, output_hash_ids=None, is_init=True,
+            session_id=None, sub_request_index=None, session_has_next=False,
+            retain_session_kv=False,
+            reuse_previous_kv=False, reused_prefix_toks=None,
+            session_kv_ttl_ns=None):
         self.id = id
         self.model = model
         self.input = input  # Always keep original input length
         self.output = output
         self.arrival = arrival
         self.instance_id = instance_id
+        self.kv_owner_instance_id = instance_id
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
@@ -78,9 +166,24 @@ class Request:
         self._prefix_npu_stats_counted = False
         self._prefix_storage_stats_counted = False
 
-        # For agentic session tracking (informational, does not drive scheduling)
-        self.session_id = None
-        self.sub_request_index = None
+        # Agentic session identity and declared continuation semantics.
+        self.session_id = session_id
+        self.sub_request_index = sub_request_index
+        self.session_has_next = session_has_next
+        self.retain_session_kv = retain_session_kv
+        self.reuse_previous_kv = reuse_previous_kv
+        self.reused_prefix_toks = reused_prefix_toks
+        self.session_kv_ttl_ns = session_kv_ttl_ns
+        self.session_kv_hit_tokens = 0
+        self.session_kv_hit_tier = None
+        # Session hit/miss metrics are committed exactly once. CPU claims stay
+        # provisional until the H2D migration completes successfully.
+        self.session_kv_outcome_recorded = False
+        self.pending_session_kv = False
+        self.pending_session_kv_bytes_per_rank = 0
+        # None means the active Request owns its KV. A session id means the
+        # completed Request transferred ownership to SessionKVState.
+        self.kv_owner_session_id = None
 
     # to print the request information
     def __str__(self):
@@ -189,6 +292,40 @@ class Request:
     def mark_kv_on_npu(self):
         self.kv_residency = KVResidency.NPU
         self.evict = False
+
+    def transfer_kv_owner(self, source_instance_id, destination_instance_id):
+        """Move NPU-resident live-KV ownership between PD instances."""
+        if self.kv_residency is not KVResidency.NPU:
+            raise RuntimeError(
+                f"Request #{self.id} cannot transfer KV ownership from "
+                f"{self.kv_residency.name} residency.")
+        if self.kv_owner_instance_id != source_instance_id:
+            raise RuntimeError(
+                f"Request #{self.id} KV owner mismatch: expected "
+                f"{source_instance_id}, got {self.kv_owner_instance_id}.")
+        self.kv_owner_instance_id = destination_instance_id
+        self.instance_id = destination_instance_id
+
+    def transfer_kv_to_session(self):
+        """Mark this completed turn's KV as owned by its session record."""
+        if self.session_id is None:
+            raise RuntimeError(
+                f"Request #{self.id} cannot park KV without a session id.")
+        if not self.session_has_next:
+            raise RuntimeError(
+                f"Terminal request #{self.id} cannot retain session KV.")
+        if not self.retain_session_kv:
+            raise RuntimeError(
+                f"Request #{self.id} has no declared continuation reuse.")
+        if self.kv_residency is not KVResidency.NPU:
+            raise RuntimeError(
+                f"Request #{self.id} cannot park KV from "
+                f"{self.kv_residency.name} residency.")
+        if self.kv_owner_session_id is not None:
+            raise RuntimeError(
+                f"Request #{self.id} KV is already owned by session "
+                f"{self.kv_owner_session_id}.")
+        self.kv_owner_session_id = self.session_id
 
 # class that manages batch of astra-sim
 class Batch:

@@ -52,6 +52,8 @@ matching runtime knobs per `instances[i]`; see
 | Flag | Default | Description |
 | --- | --- | --- |
 | `--enable-prefix-caching` | `True` | RadixAttention prefix caching. Use `--no-enable-prefix-caching` to disable |
+| `--enable-session-kv-retention` | `False` | Reuse retained NPU or CPU KV across append-only turns of the same agentic session. Supports hard TTL, colocated instances, shared CPU KV offloading, and same-node PD continuation, but not generic prefix caching |
+| `--session-kv-ttl-ns` | `0` | Default hard TTL in ns for inactive retained session KV. `0` disables time-based expiration |
 | `--enable-kv-offloading` | `False` | Phase-1 request-level exclusive migration between NPU KV and node-shared CPU DRAM. Requires `--no-enable-prefix-caching`; same-node PD only |
 | `--kv-offload-high-watermark` | `0.90` | NPU-KV pressure level that starts CPU eviction |
 | `--kv-offload-low-watermark` | `0.80` | NPU-KV target after CPU eviction; must be no greater than the high watermark |
@@ -67,13 +69,43 @@ CPU KV offloading also requires `cpu_mem.host_link_bw` and
 CPU-to-NPU path independently from the top-level NPU collective link. See
 **[Cluster config](./cluster-config#cpu_mem)**.
 
+Session KV retention uses `session_id` rather than token hashes and never
+shares KV across sessions. The workload must set `reuse_previous_kv: true` or
+provide `reused_prefix_toks` on a continuation. In colocated mode, parked
+state may remain on NPU or use the same node-shared CPU allocator as
+active-request offloading. A CPU hit completes a modeled H2D reload before
+suffix prefill begins. CPU pressure drops LRU parked session state before it
+blocks correctness-owned active-request eviction. The later continuation is a
+full-prefill miss. Generic prefix caching remains rejected.
+
+Same-node PD mode requires both session retention and CPU KV offloading on
+every prefill and decode instance on that node. Each non-terminal decode turn
+is parked through a modeled D2H workload. Its continuation adopts the
+node-shared CPU record on the prefill instance, completes a modeled H2D reload,
+and then computes only the suffix. Cross-node PD session reuse is unsupported.
+
+The instance default `--session-kv-ttl-ns` is measured from each non-terminal
+turn's completion. A workload-level `session_kv_ttl_ns` overrides it for one
+session. Expiry is a simulator event even while every instance is idle, and it
+wins over an arrival at the same timestamp. State expiring during D2H or H2D
+is hidden immediately and physically released when the synchronous transfer
+finishes.
+
 While a simulation is running, heartbeat lines report used and reserved NPU
 memory per rank and used and reserved CPU memory per node. The final
 per-instance CPU KV offloading summary reports preemptions, aggregate D2H/H2D
 bytes, migration time, reload stall count and time, and peak used/reserved
-occupancy. A CPU-resident request remains in the swapped queue while any
+occupancy. Migration byte and batch totals include both active requests and
+parked session state, while `preemption count` counts active requests only.
+A CPU-resident request remains in the swapped queue while any
 NPU-resident work is runnable, preventing an immediate reload/evict cycle
 under sustained watermark pressure.
+
+For same-node prefill/decode disaggregation, every prefill and decode instance
+on an offloading node must enable CPU KV offloading. Prompt KV remains charged
+to the prefill instance until the decode scheduler reserves destination NPU
+capacity. Under decode pressure, an ordinary CPU eviction completes before the
+handoff commits. CPU-backed prefix caching on that node remains unsupported.
 
 ## Dataset and output
 
@@ -81,7 +113,7 @@ under sustained watermark pressure.
 | --- | --- | --- | --- |
 | `--dataset` | path | `None` | JSONL workload file. See **[Workloads → JSONL format](/docs/workloads/jsonl-format)** |
 | `--num-reqs` | int | `0` | Entries to load from the dataset (`0` = all). For agentic, each entry is a session |
-| `--output` | path | `None` | Per-request CSV output path. Stdout only if `None`. The literal `{run_id}` is replaced with the active run id |
+| `--output` | path | `None` | Per-request CSV output path. Stdout only if `None`. The literal `{run_id}` is replaced with the active run id. CPU KV offloading also writes a sibling `*_kv_offload.csv` with one metrics row per enabled instance |
 
 ## Run isolation
 

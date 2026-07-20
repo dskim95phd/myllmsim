@@ -2,6 +2,16 @@ import bisect
 import json
 import random
 from .logger import get_logger
+from .request import KVResidency
+
+
+def _optional_nonnegative_int(value, field_name):
+    if value is None:
+        return None
+    result = int(value)
+    if result < 0:
+        raise ValueError(f"{field_name} must be non-negative, got {result}.")
+    return result
 
 
 class Router:
@@ -36,6 +46,7 @@ class Router:
         # Agentic session dependency tracking
         self._deferred_sessions = {}     # session_id -> session state dict
         self._request_to_session = {}    # request_id -> (session_id, sub_request_index)
+        self._session_schedulers = {}    # session_id -> affinity scheduler
         self._next_request_id = 0        # monotonic counter for unique request IDs
 
         if self.routing_policy == "RR":
@@ -82,7 +93,8 @@ class Router:
         for offset in range(num_instances):
             idx = (start + offset) % num_instances
             sched = schedulers[idx]
-            waiting = len(sched.request)
+            waiting = len(sched.request) + len(
+                getattr(sched, "pending_pd_handoffs", ()))
             running = sum(len(b.requests) for b in sched.inflight)
             raw_score = waiting * 4 + running
             capacity = getattr(sched, "max_num_seqs", 0)
@@ -159,6 +171,28 @@ class Router:
         if not sub_reqs:
             return 0
         session_id = row.get('session_id', f'session_{self._next_request_id}')
+        if session_id in self._deferred_sessions:
+            raise ValueError(f"Duplicate agentic session id: {session_id}")
+        session_kv_ttl_ns = _optional_nonnegative_int(
+            row.get('session_kv_ttl_ns'), 'session_kv_ttl_ns')
+        reused_prefix_toks = []
+        for index, sub_req in enumerate(sub_reqs):
+            reused = _optional_nonnegative_int(
+                sub_req.get('reused_prefix_toks'),
+                f'sub_requests[{index}].reused_prefix_toks')
+            input_toks = int(sub_req['input_toks'])
+            if reused is not None and reused > input_toks:
+                raise ValueError(
+                    f"sub_requests[{index}].reused_prefix_toks cannot exceed "
+                    f"input_toks ({reused} > {input_toks}).")
+            reused_prefix_toks.append(reused)
+        reuse_previous_kv = bool(row.get('reuse_previous_kv', False))
+        retain_for_next = [
+            index + 1 < len(sub_reqs) and (
+                reuse_previous_kv or
+                (reused_prefix_toks[index + 1] or 0) > 0)
+            for index in range(len(sub_reqs))
+        ]
         base_id = self._next_request_id
         self._next_request_id += len(sub_reqs)
         arrival_ns = int(row['arrival_time_ns'])
@@ -168,6 +202,10 @@ class Router:
             'sub_requests': sub_reqs,
             'next_index': 1,  # index 0 is being queued now
             'id_base': base_id,
+            'reuse_previous_kv': reuse_previous_kv,
+            'session_kv_ttl_ns': session_kv_ttl_ns,
+            'reused_prefix_toks': reused_prefix_toks,
+            'retain_for_next': retain_for_next,
         }
 
         # Queue the first sub-request
@@ -179,6 +217,11 @@ class Router:
             'arrival_time_ns': arrival_ns,
             'session_id': session_id,
             'sub_request_index': 0,
+            'session_has_next': len(sub_reqs) > 1,
+            'retain_session_kv': retain_for_next[0],
+            'reuse_previous_kv': reuse_previous_kv,
+            'reused_prefix_toks': reused_prefix_toks[0],
+            'session_kv_ttl_ns': session_kv_ttl_ns,
         }
         if enable_prefix_caching:
             req_data['input_hash_ids'] = first.get('input_tok_ids', [])
@@ -195,13 +238,41 @@ class Router:
         Returns the number of newly routed requests.
         """
         routed = 0
+        blocked = []
         while self._pending_idx < len(self._pending_requests):
             req_data = self._pending_requests[self._pending_idx]
             if req_data['arrival_time_ns'] > current_time_ns:
                 break
 
-            instance_id = self._select_instance(self.prefill_schedulers, "prefill")
-            sched = self.prefill_schedulers[instance_id]
+            session_id = req_data.get('session_id')
+            sched = self._session_schedulers.get(session_id)
+            if (sched is not None and sched.pd_type == "prefill" and
+                    self._pd_session_cpu_bridge_pending(session_id)):
+                # Preserve the request in the pending queue until the decode
+                # scheduler commits its mandatory D2H park. This is required
+                # when tool_duration_ns=0 and release shares a timestamp with
+                # decode completion.
+                blocked.append(req_data)
+                self._pending_requests.pop(self._pending_idx)
+                continue
+            if sched is None:
+                instance_id = self._select_instance(
+                    self.prefill_schedulers, "prefill")
+                sched = self.prefill_schedulers[instance_id]
+                if (session_id is not None and
+                        sched.enable_session_kv_retention):
+                    self._session_schedulers[session_id] = sched
+
+            session_metadata = {
+                'session_id': session_id,
+                'sub_request_index': req_data.get('sub_request_index'),
+                'session_has_next': req_data.get('session_has_next', False),
+                'retain_session_kv': req_data.get(
+                    'retain_session_kv', False),
+                'reuse_previous_kv': req_data.get('reuse_previous_kv', False),
+                'reused_prefix_toks': req_data.get('reused_prefix_toks'),
+                'session_kv_ttl_ns': req_data.get('session_kv_ttl_ns'),
+            }
 
             if sched.enable_prefix_caching:
                 sched.add_request([
@@ -209,18 +280,33 @@ class Router:
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                     req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
-                ], is_init=self._is_init)
+                ], is_init=self._is_init, session_metadata=session_metadata)
             else:
                 sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
-                ], is_init=self._is_init)
+                ], is_init=self._is_init, session_metadata=session_metadata)
 
             self._pending_idx += 1
             routed += 1
 
+        # Keep bridge-blocked requests at the front of the unconsumed region,
+        # without letting one session delay unrelated requests that have also
+        # arrived. Their relative order remains unchanged.
+        if blocked:
+            self._pending_requests[self._pending_idx:self._pending_idx] = blocked
+
         return routed
+
+    def _pd_session_cpu_bridge_pending(self, session_id):
+        for scheduler in self.decode_schedulers:
+            state = getattr(scheduler, "session_kv_states", {}).get(session_id)
+            if (state is not None and state.mandatory_cpu_offload and
+                    state.residency is not KVResidency.CPU and
+                    not state.invalidated):
+                return True
+        return False
 
     def has_pending_requests(self):
         """Check if there are unrouted requests remaining."""
@@ -269,6 +355,11 @@ class Router:
                 'arrival_time_ns': release_time_ns,
                 'session_id': session_id,
                 'sub_request_index': next_idx,
+                'session_has_next': next_idx + 1 < len(sub_reqs),
+                'retain_session_kv': session['retain_for_next'][next_idx],
+                'reuse_previous_kv': session['reuse_previous_kv'],
+                'reused_prefix_toks': session['reused_prefix_toks'][next_idx],
+                'session_kv_ttl_ns': session['session_kv_ttl_ns'],
             }
             if self._enable_prefix_caching:
                 req_data['input_hash_ids'] = next_sub.get('input_tok_ids', [])
@@ -280,6 +371,7 @@ class Router:
         else:
             # Session complete — all sub-requests have been released
             del self._deferred_sessions[session_id]
+            self._session_schedulers.pop(session_id, None)
 
     def _insert_pending_sorted(self, req_data):
         """Insert a request into _pending_requests maintaining arrival-time
@@ -323,13 +415,14 @@ class Router:
                 scheduler.pd_type
             )
 
-    def transfer_prefill_request(self, requests):
+    def transfer_prefill_request(self, requests, current_time_ns=0):
         for req in requests:
+            source_scheduler = self.schedulers[req.instance_id]
             if not self.same_node_pd_only:
                 instance_id = self._select_instance(self.decode_schedulers, "decode")
                 self.decode_schedulers[instance_id].add_decode(req)
                 continue
-            prefill_node_id = self.schedulers[req.instance_id].node_id
+            prefill_node_id = source_scheduler.node_id
             local_decodes = [
                 scheduler for scheduler in self.decode_schedulers
                 if scheduler.node_id == prefill_node_id
@@ -340,4 +433,10 @@ class Router:
                     f"request #{req.id}. CPU KV offloading Phase 1 supports "
                     "same-node prefill/decode disaggregation only.")
             decode_index = self._select_instance(local_decodes, "decode")
-            self.decode_schedulers[decode_index].add_decode(req)
+            target_scheduler = local_decodes[decode_index]
+            if (source_scheduler.enable_kv_offloading and
+                    target_scheduler.enable_kv_offloading):
+                target_scheduler.enqueue_pd_handoff(
+                    req, source_scheduler, current_time_ns)
+            else:
+                target_scheduler.add_decode(req)
