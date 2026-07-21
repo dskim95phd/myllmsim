@@ -129,6 +129,16 @@ removed after a successful simulation by default.
 | `--inputs-root` | path | `astra-sim/inputs/runs/<run-id>` | Override the generated ASTRA-Sim input root, for example to place intermediates on local SSD or tmpfs |
 | `--cleanup-inputs` / `--no-cleanup-inputs` | bool | `true` | Remove generated trace files after Chakra conversion and remove the generated run directory after a successful simulation. Use `--no-cleanup-inputs` to preserve traces, Chakra workloads, and input configs for debugging |
 
+## Graph conversion and host timing
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--chakra-converter` | `in-process` / `subprocess` | `in-process` | Select the Chakra text-to-protobuf converter path. `in-process` reuses the serving Python process and avoids one interpreter launch per graph. `subprocess` preserves the legacy reference path for comparisons |
+| `--workload-transport` | `file` / `ipc` | `ipc` for analytical; `file` for ns-3 | Select the ASTRA-Sim control channel. Analytical execution registers static Chakra templates and sends compact per-batch patches over a Unix-domain socket by default. Use `file` to send `.et` paths over legacy stdin for compatibility or debugging. ns-3 remains file-only |
+| `--ipc-execution` | `direct` / `oracle` | `direct` | Select how batches run when IPC transport is enabled. `direct` executes prepared in-memory iterations and skips matching per-batch trace and `.et` files. Colocated TP/PP, local-EP MoE, PIM attention, prefill/decode disaggregation, CPU KV migration, and atomic DP+EP waves use structure-keyed templates. `oracle` materializes and converts every batch, then extracts the complete dynamic graph patch before using the same prepared execution engine. It is the preferred correctness comparison for synchronized modes |
+| `--template-cache-capacity` | Integer | `64` | Maximum number of shape-keyed compute-template bundles retained by the Python frontend. The cache is LRU and records class-specific hits, misses, registrations, and evictions in `--host-timing-output` |
+| `--host-timing-output` | path | `None` | Write host-side stage distributions, workload metrics, sequence digests, lifecycle RSS checkpoints, and transport/template counters as JSON. The literal `{run_id}` is replaced with the active run id |
+
 ## Logging
 
 | Flag | Type | Default | Description |
@@ -150,6 +160,8 @@ removed after a successful simulation by default.
 | PIM attention offload | `--enable-attn-offloading` (cluster config sets `pim_config`) |
 | FP8 KV cache | `--kv-cache-dtype fp8` |
 | ns3 backend | `--network-backend ns3` |
+| Host-overhead comparison | `--host-timing-output timings-{run_id}.json`, optionally with `--chakra-converter subprocess` |
+| Legacy file workload control | `--workload-transport file` (compatibility/debug path; required for ns-3) |
 
 For the full conceptual treatment of each feature, browse the
 **[Simulator](/docs/simulator/architecture)** section. For runnable

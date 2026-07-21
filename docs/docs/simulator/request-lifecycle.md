@@ -160,21 +160,63 @@ profile DB:
 - MoE → 2D over `(local_tokens, activated_experts)`, profiled at
   TP=1.
 
-The output is a tab-separated text trace at
+In compatibility or oracle execution, the output is a tab-separated text trace at
 `astra-sim/inputs/runs/<run_id>/trace/<hw>/<model>/instance_{i}_batch_{b}.txt`.
 The text trace is an intermediate input to the Chakra converter and is
 removed after the `.et` graph is generated unless `--no-cleanup-inputs`
-is set.
+is set. With analytical IPC/direct enabled, after a structure has been
+registered, matching batches remain as structured in-memory records and do
+not create the per-batch text file.
 Full mechanics on **[Trace generation](./trace-generation)**.
 
 ## Stage 7, Converted to Chakra graph
 
-`graph_generator.generate_graph` shells out to Chakra's text→protobuf
-converter, producing
+`graph_generator.generate_graph` calls Chakra's text-to-protobuf converter
+in the serving Python process by default, producing
 `astra-sim/inputs/runs/<run_id>/workload/<hw>/<model>/instance_{i}_batch_{b}/llm.et`.
 Chakra workloads remain available while ASTRA-Sim consumes them; the
 run directory is removed after a successful simulation unless
 `--no-cleanup-inputs` is set.
+
+Use `--chakra-converter subprocess` to retain the legacy one-process-per-graph
+reference path. Both modes produce the same Chakra workload format; this
+option changes host overhead, not simulated behavior.
+
+The analytical backend uses `--workload-transport ipc` by default. It sends
+framed protobuf messages over a run-specific Unix-domain socket and performs a versioned `HELLO`
+handshake. IPC startup registers the event-handler Chakra bundle, and the first
+independent compute batch per instance bootstraps a static compute template.
+ASTRA-Sim parses these graphs into immutable nodes, child adjacency, and
+initial dependency counts. It also validates that two independent iteration
+states can traverse the graph without modifying the template, then returns
+stable template ids. For independent compute batches, Python now sends a
+`BatchPatch` first and ASTRA-Sim applies it to a fresh iteration state. The
+default `--ipc-execution direct` path installs that state into the existing
+compute, communication, and memory issue engine without sending the `.et`
+path. `--ipc-execution oracle` materializes and converts each batch, extracts
+all dynamic values from that full graph, and submits them through the same
+prepared execution engine. This isolates direct-patch correctness from legacy
+stdin event-order differences. Colocated TP/PP, local-EP MoE, PIM attention, CPU KV
+migration, and prefill/decode workloads materialize one graph bundle per
+distinct trace structure to bootstrap and validate a shape-keyed template.
+Prefill templates atomically include both the physical prefill graphs and the
+paired decode-side receive graphs. Later matching batches derive patches from
+the in-memory trace values and skip both the trace-file write and Chakra
+conversion. DP/EP groups build one patch per real or dummy participant and
+submit the complete set with atomic `RUN_WAVE`. ASTRA-Sim validates every
+participant before installing any runtime state, then launches the full wave
+and returns correlated `BATCH_DONE` events. The frontend keeps an LRU-bounded
+shape cache and records class-specific hits, misses, registrations, and
+evictions in the host-timing output.
+
+When every simulated system is idle during an agent tool call, Python sends an
+explicit `ADVANCE_TIME` message before releasing the next turn. ASTRA-Sim does
+not infer simulated time from host-side graph-generation or IPC latency.
+The direct stdout drain retains only a bounded diagnostic tail, so long runs do
+not accumulate backend log lines in the Python frontend. Lifecycle RSS
+checkpoints are included in host-timing JSON. ns-3 remains on file transport
+because it does not yet implement this protocol; analytical users can also set
+`--workload-transport file` explicitly for compatibility or graph debugging.
 
 The Chakra converter creates:
 
@@ -186,20 +228,22 @@ The Chakra converter creates:
 
 ## Stage 8, Submitted to ASTRA-Sim
 
-`controller.write_flush(process, workload_path)` sends the path over
-stdin. ASTRA-Sim reads the `.et` file, simulates compute + comm
-according to the network topology, and emits:
+File transport sends the workload path over stdin, while direct IPC installs
+the prepared iteration in memory. Both paths use the same ASTRA-Sim compute,
+communication, and memory issue logic. File mode emits:
 
 ```
 Waiting <sys=0> id=42 cycle=178654321
 ```
 
-`controller.read_wait` blocks until that line appears.
+`controller.read_wait` blocks until that line appears. Direct IPC instead
+waits for a structured `BATCH_DONE` message, avoiding repeated `PASS` polling.
 
-For **DP groups**, both instances' `.et` files share the same workload
-folder and matching stream IDs on the ALLTOALL collectives. ASTRA-Sim
-blocks until both NPUs reach the collective, naturally
-wave-synchronizing them.
+For **DP groups**, use IPC oracle or direct execution. The legacy file control
+path is rejected because it cannot atomically install every collective
+participant. Direct IPC carries the same
+static stream IDs in registered templates and atomically installs all
+participants through `RUN_WAVE`, including dummy participants for idle ranks.
 
 ## Stage 9, Marked done
 

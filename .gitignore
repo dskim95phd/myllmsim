@@ -5,6 +5,8 @@ env/
 *.pyc
 __pycache__/
 *.joblib
+*.profile-cache.json.gz
+.llmservingsim-profile-cache-*.json.gz
 
 # Ignore pkl files
 *.pkl

@@ -475,6 +475,11 @@ def print_input_config(args: Any, runtime_configs: list[dict[str, Any]] | None =
     add("link_bw", "Link bandwidth (GB/s)")
     add("link_latency", "Link latency (ns)")
     add("network_backend", "Network backend", _na)
+    add("chakra_converter", "Chakra converter", _na)
+    add("workload_transport", "Workload transport", _na)
+    add("ipc_execution", "IPC execution", _na)
+    add("workload_ipc_socket", "Workload IPC socket", _na)
+    add("host_timing_output", "Host timing output", _na)
     add("log_interval", "Log interval (s)")
     add("log_level", "Log level", _na)
 

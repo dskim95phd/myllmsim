@@ -1,0 +1,106 @@
+syntax = "proto3";
+
+package llmservingsim.ipc;
+
+message Hello {
+  uint32 protocol_version = 1;
+  repeated string capabilities = 2;
+}
+
+message Error {
+  uint64 request_id = 1;
+  string code = 2;
+  string message = 3;
+}
+
+message TemplateGraph {
+  uint32 system_id = 1;
+  bytes chakra_graph = 2;
+}
+
+message SlotBinding {
+  uint32 slot_id = 1;
+  uint32 system_id = 2;
+  uint64 node_id = 3;
+  string attribute = 4;
+  bool required = 5;
+}
+
+message RegisterTemplate {
+  uint64 request_id = 1;
+  string template_key = 2;
+  repeated TemplateGraph graphs = 3;
+  repeated SlotBinding bindings = 4;
+}
+
+message CompiledGraphSummary {
+  uint32 system_id = 1;
+  uint64 node_count = 2;
+  uint64 root_count = 3;
+  bool iteration_state_validated = 4;
+}
+
+message TemplateReady {
+  uint64 request_id = 1;
+  uint64 template_id = 2;
+  string template_key = 3;
+  repeated CompiledGraphSummary graphs = 4;
+}
+
+message SlotValue {
+  uint32 slot_id = 1;
+  uint64 value = 2;
+}
+
+message SystemPatch {
+  uint32 system_id = 1;
+  repeated SlotValue values = 2;
+  // Alternating slot_id, value entries. New senders use this packed scalar
+  // representation to avoid allocating one protobuf message per slot.
+  repeated uint64 packed_values = 3 [packed = true];
+}
+
+message BatchPatch {
+  uint64 batch_id = 1;
+  uint64 template_id = 2;
+  repeated SystemPatch systems = 3;
+}
+
+message RunBatch {
+  uint64 request_id = 1;
+  uint32 instance_id = 2;
+  BatchPatch patch = 3;
+  bool execute = 4;
+}
+
+message BatchAccepted {
+  uint64 request_id = 1;
+  uint64 batch_id = 2;
+  uint64 template_id = 3;
+  uint32 system_count = 4;
+  uint64 patched_value_count = 5;
+}
+
+message WaveRun {
+  uint32 instance_id = 1;
+  BatchPatch patch = 2;
+}
+
+message RunWave {
+  uint64 request_id = 1;
+  uint64 wave_id = 2;
+  repeated WaveRun runs = 3;
+}
+
+message BatchDone {
+  uint64 request_id = 1;
+  uint32 system_id = 2;
+  uint64 batch_id = 3;
+  uint64 cycles = 4;
+  uint64 exposed_communication_cycles = 5;
+}
+
+message SystemCommand {
+  uint64 request_id = 1;
+  uint32 system_id = 2;
+}

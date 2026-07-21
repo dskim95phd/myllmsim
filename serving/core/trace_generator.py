@@ -1,6 +1,15 @@
 import os
-import re
+import gzip
+import hashlib
+import json
+import tempfile
 from .request import *
+from .host_timing import (
+    increment_active,
+    measure_active,
+    timed_active_stage,
+    timed_stage,
+)
 from .utils import *
 import pandas as pd
 import yaml
@@ -11,6 +20,11 @@ from .power_model import PowerModel, total_ring_data
 from .pim_model import PIMModel
 from .logger import get_logger
 from .run_paths import input_path
+from .chakra_template import (
+    RuntimeTraceMarker,
+    RuntimeTraceRow,
+    RuntimeTraceSnapshot,
+)
 import bisect
 from dataclasses import dataclass, field
 
@@ -20,8 +34,71 @@ from dataclasses import dataclass, field
 # value: dict with keys {meta, architecture, catalog, sequence, tables}
 # ----------------------------------------------------------------------
 _perf_db_cache = {}
+_PROFILE_CACHE_SCHEMA = 1
+_PROFILE_CACHE_NAME = ".llmservingsim-profile-cache-v1.json.gz"
 
 logger = get_logger("TraceGenerator")
+
+
+def _compiled_profile_cache_path(root, identity):
+    override = os.environ.get("LLMSERVINGSIM_PROFILE_CACHE_DIR")
+    if not override:
+        return os.path.join(root, _PROFILE_CACHE_NAME)
+    identity_bytes = json.dumps(
+        identity, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    cache_key = hashlib.sha256(identity_bytes).hexdigest()
+    return os.path.join(
+        os.path.abspath(override), f"{cache_key}-{_PROFILE_CACHE_NAME[1:]}")
+
+
+@dataclass(frozen=True)
+class GeneratedTrace:
+    path: str
+    text: object
+    materialized: bool
+    runtime_trace: object = None
+
+    def ensure_text(self):
+        if self.text is not None:
+            return self.text
+        if self.runtime_trace is None:
+            raise ValueError("Generated trace has no renderable runtime records.")
+        return self.runtime_trace.render()
+
+
+def materialize_generated_trace(generated_trace):
+    if generated_trace.materialized:
+        return generated_trace
+    trace_text = generated_trace.ensure_text()
+    os.makedirs(os.path.dirname(generated_trace.path), exist_ok=True)
+    with open(generated_trace.path, "w") as trace_file:
+        trace_file.write(trace_text)
+    return GeneratedTrace(
+        generated_trace.path, trace_text, True,
+        runtime_trace=generated_trace.runtime_trace)
+
+
+def _number_runtime_records(records):
+    numbered = []
+    for index, record in enumerate(records):
+        if isinstance(record, RuntimeTraceMarker):
+            numbered.append(record)
+            continue
+        numbered.append(RuntimeTraceRow(
+            name=f"{record.name}_{index}",
+            comp_time=record.comp_time,
+            input_loc=record.input_loc,
+            input_size=record.input_size,
+            weight_loc=record.weight_loc,
+            weight_size=record.weight_size,
+            output_loc=record.output_loc,
+            output_size=record.output_size,
+            comm_type=record.comm_type,
+            comm_size=record.comm_size,
+            misc=record.misc,
+        ))
+    return tuple(numbered)
 
 
 # ----------------------------------------------------------------------
@@ -173,8 +250,9 @@ def _load_architecture(model_type):
             f"Architecture yaml not found for model_type={model_type!r} at {path}. "
             f"Add profiler/models/{model_type}.yaml describing the architecture."
         )
-    with open(path, "r") as f:
-        arch = yaml.safe_load(f)
+    with measure_active("architecture_catalog_loading"):
+        with open(path, "r") as f:
+            arch = yaml.safe_load(f)
     if "catalog" not in arch or "sequence" not in arch:
         raise KeyError(
             f"Architecture yaml {path} must define both 'catalog' and 'sequence'."
@@ -188,8 +266,9 @@ def _load_meta(variant_root):
         raise FileNotFoundError(
             f"meta.yaml missing at {path}. Re-run the profiler to produce it."
         )
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+    with measure_active("profile_meta_hydration"):
+        with open(path, "r") as f:
+            return yaml.safe_load(f)
 
 
 def _hydrate_skew_fit_tables(meta, variant_root):
@@ -222,7 +301,8 @@ def _hydrate_skew_fit_tables(meta, variant_root):
                 "alpha_default", tp_key, csv_path,
             )
             continue
-        alphas, counts = _read_skew_fit_csv(csv_path)
+        with measure_active("profile_skew_table_hydration"):
+            alphas, counts = _read_skew_fit_csv(csv_path)
         entry["alpha_by_bucket"] = alphas
         entry["n_by_bucket"] = counts
 
@@ -261,9 +341,10 @@ def _read_category_csv(path, key_cols):
     """
     if not os.path.isfile(path):
         return None
-    df = pd.read_csv(path, sep=",")
-    # time_us -> latency_ns (int, min 1)
-    df["latency_ns"] = (df["time_us"].astype(float) * 1_000.0).round().astype(int).clip(lower=1)
+    with measure_active("profile_csv_hydration"):
+        df = pd.read_csv(path, sep=",")
+        # time_us -> latency_ns (int, min 1)
+        df["latency_ns"] = (df["time_us"].astype(float) * 1_000.0).round().astype(int).clip(lower=1)
     return df
 
 
@@ -323,6 +404,162 @@ def _build_moe_table(df):
             "rows": [tokens_by_experts[a] for a in ae_vals]}
 
 
+def _profile_source_paths(root, model_type):
+    paths = [
+        os.path.join(root, "meta.yaml"),
+        _arch_yaml_path(model_type),
+    ]
+    for entry in sorted(os.listdir(root)):
+        if not entry.startswith("tp"):
+            continue
+        for name in (
+                "dense.csv", "per_sequence.csv", "attention.csv",
+                "moe.csv", "skew_fit.csv"):
+            path = os.path.join(root, entry, name)
+            if os.path.isfile(path):
+                paths.append(path)
+    return paths
+
+
+def _profile_source_fingerprints(root, model_type):
+    fingerprints = []
+    with measure_active("profile_cache_fingerprinting"):
+        for path in _profile_source_paths(root, model_type):
+            digest = hashlib.sha256()
+            with open(path, "rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+            fingerprints.append({
+                "path": os.path.relpath(path, root).replace(os.sep, "/"),
+                "size": os.path.getsize(path),
+                "sha256": digest.hexdigest(),
+            })
+    return fingerprints
+
+
+def _encode_attention_table(table):
+    return {
+        "pc_vals": table["pc_vals"],
+        "nd_vals": table["nd_vals"],
+        "pc_nd_pairs": [list(pair) for pair in table["pc_nd_pairs"]],
+        "slices": [
+            {
+                "pc": pc,
+                "nd": nd,
+                "kv_prefill_vals": value["kv_prefill_vals"],
+                "rows": value["rows"],
+            }
+            for (pc, nd), value in sorted(table["slices"].items())
+        ],
+    }
+
+
+def _decode_attention_table(table):
+    return {
+        "pc_vals": [int(value) for value in table["pc_vals"]],
+        "nd_vals": [int(value) for value in table["nd_vals"]],
+        "pc_nd_pairs": [
+            (int(pair[0]), int(pair[1]))
+            for pair in table["pc_nd_pairs"]
+        ],
+        "slices": {
+            (int(value["pc"]), int(value["nd"])): {
+                "kv_prefill_vals": [
+                    int(item) for item in value["kv_prefill_vals"]],
+                "rows": value["rows"],
+            }
+            for value in table["slices"]
+        },
+    }
+
+
+def _encode_profile_tables(tables_per_tp):
+    encoded = {}
+    for tp, tables in tables_per_tp.items():
+        encoded_tables = dict(tables)
+        if "attention" in encoded_tables:
+            encoded_tables["attention"] = _encode_attention_table(
+                encoded_tables["attention"])
+        encoded[str(tp)] = encoded_tables
+    return encoded
+
+
+def _decode_profile_tables(encoded):
+    tables_per_tp = {}
+    for tp, tables in encoded.items():
+        decoded_tables = dict(tables)
+        if "attention" in decoded_tables:
+            decoded_tables["attention"] = _decode_attention_table(
+                decoded_tables["attention"])
+        tables_per_tp[int(tp)] = decoded_tables
+    return tables_per_tp
+
+
+def _load_compiled_profile_cache(cache_path, identity, fingerprints):
+    if os.environ.get("LLMSERVINGSIM_PROFILE_CACHE", "1") == "0":
+        return None
+    if not os.path.isfile(cache_path):
+        return None
+    try:
+        with measure_active("profile_compiled_cache_read"):
+            with gzip.open(cache_path, "rt", encoding="utf-8") as source:
+                cached = json.load(source)
+        if cached.get("schema_version") != _PROFILE_CACHE_SCHEMA:
+            return None
+        if cached.get("identity") != identity:
+            return None
+        if cached.get("fingerprints") != fingerprints:
+            return None
+        payload = cached["payload"]
+        return {
+            "meta": payload["meta"],
+            "architecture": payload["architecture"],
+            "variant": identity["variant"],
+            "hardware": identity["hardware"],
+            "model": identity["model"],
+            "available_tps": [int(tp) for tp in payload["available_tps"]],
+            "tables": _decode_profile_tables(payload["tables"]),
+        }
+    except (OSError, EOFError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _write_compiled_profile_cache(cache_path, identity, fingerprints,
+                                  perf_db):
+    if os.environ.get("LLMSERVINGSIM_PROFILE_CACHE", "1") == "0":
+        return False
+    document = {
+        "schema_version": _PROFILE_CACHE_SCHEMA,
+        "identity": identity,
+        "fingerprints": fingerprints,
+        "payload": {
+            "meta": perf_db["meta"],
+            "architecture": perf_db["architecture"],
+            "available_tps": perf_db["available_tps"],
+            "tables": _encode_profile_tables(perf_db["tables"]),
+        },
+    }
+    directory = os.path.dirname(cache_path)
+    temporary_path = None
+    try:
+        with measure_active("profile_compiled_cache_write"):
+            os.makedirs(directory, exist_ok=True)
+            descriptor, temporary_path = tempfile.mkstemp(
+                prefix=".profile-cache-", suffix=".tmp", dir=directory)
+            os.close(descriptor)
+            with gzip.open(temporary_path, "wt", encoding="utf-8") as output:
+                json.dump(document, output, separators=(",", ":"))
+            os.replace(temporary_path, cache_path)
+        return True
+    except OSError:
+        if temporary_path and os.path.exists(temporary_path):
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+        return False
+
+
 def _load_perf_db(hardware, model, variant, tp_needed, model_type):
     """Load the per-category perf DB for a (hardware, model, variant)
     tuple and cache it. ``tp_needed`` is a set of int TP degrees the
@@ -330,24 +567,55 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
     """
     cache_key = (hardware, model, variant)
     if cache_key in _perf_db_cache:
+        increment_active("profile_db_cache_hits")
         db = _perf_db_cache[cache_key]
         _check_tp_coverage(db, tp_needed, hardware, model, variant)
         return db
 
-    root = _variant_root(hardware, model, variant)
-    if not os.path.isdir(root):
-        raise FileNotFoundError(
-            f"Profile variant folder not found: {root}. Run the profiler "
-            f"with matching --dtype / --kv-cache-dtype, or pick an existing "
-            f"variant under {os.path.dirname(root)}."
-        )
+    increment_active("profile_db_cache_misses")
+
+    with measure_active("profile_db_file_discovery"):
+        root = _variant_root(hardware, model, variant)
+        if not os.path.isdir(root):
+            raise FileNotFoundError(
+                f"Profile variant folder not found: {root}. Run the profiler "
+                f"with matching --dtype / --kv-cache-dtype, or pick an existing "
+                f"variant under {os.path.dirname(root)}."
+            )
+        profile_entries = sorted(os.listdir(root))
+
+    available_on_disk = []
+    for entry in profile_entries:
+        if entry.startswith("tp"):
+            try:
+                available_on_disk.append(int(entry[2:]))
+            except ValueError:
+                pass
+    identity = {
+        "hardware": hardware,
+        "model": model,
+        "variant": variant,
+        "model_type": model_type,
+        "tp_degrees": sorted(available_on_disk),
+    }
+    fingerprints = _profile_source_fingerprints(root, model_type)
+    compiled_cache_path = _compiled_profile_cache_path(root, identity)
+    compiled = _load_compiled_profile_cache(
+        compiled_cache_path, identity, fingerprints)
+    if compiled is not None:
+        increment_active("profile_compiled_cache_hits")
+        _perf_db_cache[cache_key] = compiled
+        _check_tp_coverage(
+            compiled, tp_needed, hardware, model, variant)
+        return compiled
+    increment_active("profile_compiled_cache_misses")
 
     meta = _load_meta(root)
     _hydrate_skew_fit_tables(meta, root)
     arch = _load_architecture(model_type)
     tables_per_tp = {}
     available_tps = []
-    for entry in sorted(os.listdir(root)):
+    for entry in profile_entries:
         if not entry.startswith("tp"):
             continue
         try:
@@ -359,19 +627,23 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
 
         dense_df = _read_category_csv(os.path.join(tp_dir, "dense.csv"), None)
         if dense_df is not None:
-            tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
+            with measure_active("profile_table_build"):
+                tables["dense"] = _build_1d_table(dense_df, "layer", "tokens")
 
         per_seq_df = _read_category_csv(os.path.join(tp_dir, "per_sequence.csv"), None)
         if per_seq_df is not None:
-            tables["per_sequence"] = _build_1d_table(per_seq_df, "layer", "sequences")
+            with measure_active("profile_table_build"):
+                tables["per_sequence"] = _build_1d_table(per_seq_df, "layer", "sequences")
 
         attn_df = _read_category_csv(os.path.join(tp_dir, "attention.csv"), None)
         if attn_df is not None:
-            tables["attention"] = _build_attention_table(attn_df)
+            with measure_active("profile_table_build"):
+                tables["attention"] = _build_attention_table(attn_df)
 
         moe_df = _read_category_csv(os.path.join(tp_dir, "moe.csv"), None)
         if moe_df is not None:
-            tables["moe"] = _build_moe_table(moe_df)
+            with measure_active("profile_table_build"):
+                tables["moe"] = _build_moe_table(moe_df)
 
         tables_per_tp[tp] = tables
         available_tps.append(tp)
@@ -385,6 +657,9 @@ def _load_perf_db(hardware, model, variant, tp_needed, model_type):
         "available_tps": sorted(available_tps),
         "tables": tables_per_tp,
     }
+    if _write_compiled_profile_cache(
+            compiled_cache_path, identity, fingerprints, perf_db):
+        increment_active("profile_compiled_cache_writes")
     _perf_db_cache[cache_key] = perf_db
     _check_tp_coverage(perf_db, tp_needed, hardware, model, variant)
     return perf_db
@@ -506,24 +781,26 @@ def _effective_tp(perf_db, category, name, tp):
 
 
 def _lookup_dense(perf_db, name, tp, tokens):
-    tp_eff = _effective_tp(perf_db, "dense", name, tp)
-    tbl = _tp_tables(perf_db, tp_eff).get("dense", {}).get(name)
-    if tbl is None:
-        raise KeyError(
-            f"Missing dense profile for layer={name} on tp={tp_eff}. "
-            f"Check that the architecture catalog and dense.csv agree."
-        )
-    return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(tokens), 1))))
+    with measure_active("dense_lookup"):
+        tp_eff = _effective_tp(perf_db, "dense", name, tp)
+        tbl = _tp_tables(perf_db, tp_eff).get("dense", {}).get(name)
+        if tbl is None:
+            raise KeyError(
+                f"Missing dense profile for layer={name} on tp={tp_eff}. "
+                f"Check that the architecture catalog and dense.csv agree."
+            )
+        return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(tokens), 1))))
 
 
 def _lookup_per_sequence(perf_db, name, tp, sequences):
-    tp_eff = _effective_tp(perf_db, "per_sequence", name, tp)
-    tbl = _tp_tables(perf_db, tp_eff).get("per_sequence", {}).get(name)
-    if tbl is None:
-        raise KeyError(
-            f"Missing per-sequence profile for layer={name} on tp={tp_eff}."
-        )
-    return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
+    with measure_active("per_sequence_lookup"):
+        tp_eff = _effective_tp(perf_db, "per_sequence", name, tp)
+        tbl = _tp_tables(perf_db, tp_eff).get("per_sequence", {}).get(name)
+        if tbl is None:
+            raise KeyError(
+                f"Missing per-sequence profile for layer={name} on tp={tp_eff}."
+            )
+        return max(1, int(_lookup_1d(tbl["keys"], tbl["values"], max(int(sequences), 1))))
 
 
 def _axis_bracket(values, query):
@@ -711,6 +988,7 @@ def _skew_alpha(
     return float(entry.get("alpha_default", _ATTN_SKEW_ALPHA_FALLBACK))
 
 
+@timed_active_stage("attention_lookup")
 def _lookup_attention_with_skew(
     perf_db, tp, prefill_chunk, kv_prefill,
     n_decode, kv_decode_mean, kv_decode_max, kv_decode_min,
@@ -793,6 +1071,7 @@ def _lookup_attention(perf_db, tp, prefill_chunk, kv_prefill, n_decode, kv_decod
     return max(1, int(out))
 
 
+@timed_active_stage("moe_lookup")
 def _lookup_moe(perf_db, tokens, activated_experts):
     """MoE is profiled once at tp=1 (single-rank view); the simulator
     looks up per EP-rank token counts.
@@ -956,7 +1235,19 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
-    lines.append(formatter(layer_name, str(latency_ns), input_loc, str(inp), wt_loc, str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
+    lines.append(RuntimeTraceRow(
+        name=layer_name,
+        comp_time=latency_ns,
+        input_loc=input_loc,
+        input_size=inp,
+        weight_loc=wt_loc,
+        weight_size=wt,
+        output_loc=output_loc,
+        output_size=out,
+        comm_type=comm_type,
+        comm_size=comm_size,
+        misc=batch_tag,
+    ))
 
     if power_acc is not None:
         power_acc.npu_latencies_ns.append(latency_ns)
@@ -988,21 +1279,30 @@ def _with_dim(comm_type, involved_dim):
 def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
     """Emit PIM attention for decode requests across PIM channels."""
     for ch in range(ctx.pim_channels):
-        lines.append(f"PIM {ch}\n")
+        lines.append(RuntimeTraceMarker("PIM", str(ch)))
         for L in bctx.decode_lens[ch]:
             inp, _, out = calculate_sizes(ctx.model, "attention", L, pim=True, parallel=ctx.tp_size, fp=ctx.fp)
             inp //= bctx.channel_split
             out //= bctx.channel_split
             pim_lat = int(ctx.pim_model.get_pim_latency(ctx.n_head, ctx.kv_head, ctx.head_dim, L, bctx.channel_split))
-            lines.append(formatter("attention", str(pim_lat),
-                f'REMOTE:{ctx.node_id}.{ch}', str(inp),
-                get_device(ctx.placement, layer_num, "attention", "weights"), '0',
-                f'REMOTE:{ctx.node_id}.{ch}', str(out),
-                'NONE', '0', batch_tag))
+            lines.append(RuntimeTraceRow(
+                name="attention",
+                comp_time=pim_lat,
+                input_loc=f'REMOTE:{ctx.node_id}.{ch}',
+                input_size=inp,
+                weight_loc=get_device(
+                    ctx.placement, layer_num, "attention", "weights"),
+                weight_size=0,
+                output_loc=f'REMOTE:{ctx.node_id}.{ch}',
+                output_size=out,
+                comm_type='NONE',
+                comm_size=0,
+                misc=batch_tag,
+            ))
             if power_acc is not None and pim_lat > 0:
                 power_acc.pim_latencies_ns.append(pim_lat)
                 power_acc.dram_weight_bytes += inp + out
-    lines.append("PIM END\n")
+    lines.append(RuntimeTraceMarker("PIM", "END"))
 
 
 def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
@@ -1071,9 +1371,11 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
 
     for i in range(emit_ep):
         if i == 0:
-            lines.append(f"EXPERT {i} {dispatch_comm_type} {dispatch_comm_size}\n")
+            lines.append(RuntimeTraceMarker(
+                "EXPERT", str(i), dispatch_comm_type,
+                dispatch_comm_size))
         else:
-            lines.append(f"EXPERT {i} NONE 0\n")
+            lines.append(RuntimeTraceMarker("EXPERT", str(i)))
 
         # ``local_tokens`` here is the per-rank workload after dispatch
         # — already scaled to this rank's real tokens (no DP-padding sum).
@@ -1087,8 +1389,19 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
                 ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
-            lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
-                wt_loc, str(rank_wt), 'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
+            lines.append(RuntimeTraceRow(
+                name="expert",
+                comp_time=rank_latency_ns,
+                input_loc='LOCAL',
+                input_size=rank_inp,
+                weight_loc=wt_loc,
+                weight_size=rank_wt,
+                output_loc='LOCAL',
+                output_size=rank_out,
+                comm_type='NONE',
+                comm_size=0,
+                misc=batch_tag,
+            ))
 
             if power_acc is not None and wt_loc != 'LOCAL':
                 power_acc.dram_weight_bytes += rank_wt
@@ -1097,7 +1410,8 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     if power_acc is not None and max_rank_latency_ns > 0:
         power_acc.npu_latencies_ns.append(max_rank_latency_ns)
 
-    lines.append(f"EXPERT END {combine_comm_type} {combine_comm_size}\n")
+    lines.append(RuntimeTraceMarker(
+        "EXPERT", "END", combine_comm_type, combine_comm_size))
 
     # Post-expert ReduceScatter power (combine)
     if power_acc is not None and ep_total > 1:
@@ -1229,7 +1543,7 @@ def _layer_latency_for_power(ctx, bctx, layer_name):
     return _lookup_dense(ctx.perf_db, layer_name, ctx.tp_size, bctx.total_len)
 
 
-def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
+def _emit_final_layers(ctx, bctx, records, batch_tag='NONE'):
     """Emit the architecture's head layers (final_layernorm, lm_head,
     sampler — ordered per the yaml) and feed them into the power model.
     The last emitted layer routes its output to REMOTE so the Chakra
@@ -1240,7 +1554,7 @@ def _emit_final_layers(ctx, bctx, f, batch_tag='NONE'):
     for i, layer_name in enumerate(head_layers):
         output_loc = f'REMOTE:{ctx.node_id}' if i == len(head_layers) - 1 else 'LOCAL'
         _emit_layer(ctx, bctx, layer_name, lines, None, batch_tag, output_loc=output_loc)
-    f.writelines(lines)
+    records.extend(lines)
 
     if ctx.power_model is not None:
         for layer_name in head_layers:
@@ -1268,7 +1582,7 @@ def _emit_pp_pd_power(ctx, bctx):
 # _synthesize_trace (non-interleaved)
 # ======================================================================
 
-def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
+def _emit_prologue(ctx, bctx, records, batch_tag='NONE'):
     """Emit prologue layers (typically just embedding). The first layer's
     input is routed from REMOTE to match the Chakra converter's
     MEM_LOAD node placement.
@@ -1280,7 +1594,7 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
     for i, layer_name in enumerate(prologue_layers):
         input_loc = f'REMOTE:{ctx.node_id}' if i == 0 else 'LOCAL'
         _emit_layer(ctx, bctx, layer_name, lines, None, batch_tag, input_loc=input_loc)
-    f.writelines(lines)
+    records.extend(lines)
     if ctx.power_model:
         for layer_name in prologue_layers:
             lat = _layer_latency_for_power(ctx, bctx, layer_name)
@@ -1292,7 +1606,7 @@ def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
 
 
 def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
-                      batch, max_len, output_path, placement, block_mode_on, gate,
+                      batch, max_len, records, placement, block_mode_on, gate,
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
@@ -1312,32 +1626,30 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
         extra={"node_id": node_id, "instance_id": instance_id},
     )
 
-    with open(output_path, 'w') as f:
-        _emit_prologue(ctx, bctx, f)
+    _emit_prologue(ctx, bctx, records)
 
-        # Transformer blocks
-        num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
+    # Transformer blocks
+    num_layers = config['num_hidden_layers']
+    iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
 
-        for layer_num in range(iter_count):
-            block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
+    for layer_num in range(iter_count):
+        block_lines, block_power = _build_transformer_block(
+            ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
-                f.writelines(block_lines)
+        # MoE blocks are only safely replayable when the router opts into
+        # block copy. Structured records are immutable and safe to repeat.
+        can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+        if can_copy:
+            for _ in range(copy_count):
+                records.extend(block_lines)
                 block_power.flush(ctx, enable_attn_offloading)
+        else:
+            records.extend(block_lines)
+            block_power.flush(ctx, enable_attn_offloading)
 
-        # Final layers
-        _emit_final_layers(ctx, bctx, f)
-        _emit_pp_pd_power(ctx, bctx)
+    # Final layers
+    _emit_final_layers(ctx, bctx, records)
+    _emit_pp_pd_power(ctx, bctx)
 
 
 # ======================================================================
@@ -1345,7 +1657,7 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 # ======================================================================
 
 def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_total, pd_type, node_id, instance_id,
-                                  batches, max_len, output_path, placement, block_mode_on, gate,
+                                  batches, max_len, records, placement, block_mode_on, gate,
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
@@ -1374,70 +1686,80 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
     num_layers = config['num_hidden_layers']
 
-    with open(output_path, 'w') as f:
-        # PROLOGUE: Batch1 prologue + first pre-attn
-        _emit_prologue(ctx, bctx1, f, 'BATCH_1')
+    # PROLOGUE: Batch1 prologue + first pre-attn
+    _emit_prologue(ctx, bctx1, records, 'BATCH_1')
 
-        pre_attn1_lines = []
-        pre_attn1_power = PowerAccumulator([], [], 0, 0)
-        _emit_pre_attn_layers(ctx, bctx1, 0, pre_attn1_lines, pre_attn1_power, 'BATCH_1')
-        f.writelines(pre_attn1_lines)
-        pre_attn1_power.flush(ctx, enable_attn_offloading)
+    pre_attn1_lines = []
+    pre_attn1_power = PowerAccumulator([], [], 0, 0)
+    _emit_pre_attn_layers(
+        ctx, bctx1, 0, pre_attn1_lines, pre_attn1_power, 'BATCH_1')
+    records.extend(pre_attn1_lines)
+    pre_attn1_power.flush(ctx, enable_attn_offloading)
 
-        # Batch2 prologue + first pre-attn
-        _emit_prologue(ctx, bctx2, f, 'BATCH_2')
+    # Batch2 prologue + first pre-attn
+    _emit_prologue(ctx, bctx2, records, 'BATCH_2')
 
-        pre_attn2_lines = []
-        pre_attn2_power = PowerAccumulator([], [], 0, 0)
-        _emit_pre_attn_layers(ctx, bctx2, 0, pre_attn2_lines, pre_attn2_power, 'BATCH_2')
-        f.writelines(pre_attn2_lines)
-        pre_attn2_power.flush(ctx, enable_attn_offloading)
+    pre_attn2_lines = []
+    pre_attn2_power = PowerAccumulator([], [], 0, 0)
+    _emit_pre_attn_layers(
+        ctx, bctx2, 0, pre_attn2_lines, pre_attn2_power, 'BATCH_2')
+    records.extend(pre_attn2_lines)
+    pre_attn2_power.flush(ctx, enable_attn_offloading)
 
-        # MIDDLE LAYERS: interleaved post_attn + pre_attn
-        middle_layers = num_layers - 1
-        iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
+    # MIDDLE LAYERS: interleaved post_attn + pre_attn
+    middle_layers = num_layers - 1
+    iter_count, copy_count = (
+        (middle_layers, 1) if block_mode_on else (1, middle_layers))
 
-        for layer_num in range(iter_count):
-            block_lines = []
-            block_power = PowerAccumulator([], [], 0, 0)
+    for layer_num in range(iter_count):
+        block_lines = []
+        block_power = PowerAccumulator([], [], 0, 0)
 
-            # Batch1: post_attn(current) + pre_attn(next)
-            _emit_post_attn_layers(ctx, bctx1, layer_num, block_lines, block_power, f"{batches[0].batch_id}.0", 'BATCH_1')
-            _emit_pre_attn_layers(ctx, bctx1, layer_num + 1, block_lines, block_power, 'BATCH_1')
+        # Batch1: post_attn(current) + pre_attn(next)
+        _emit_post_attn_layers(
+            ctx, bctx1, layer_num, block_lines, block_power,
+            f"{batches[0].batch_id}.0", 'BATCH_1')
+        _emit_pre_attn_layers(
+            ctx, bctx1, layer_num + 1, block_lines, block_power, 'BATCH_1')
 
-            # Batch2: post_attn(current) + pre_attn(next)
-            _emit_post_attn_layers(ctx, bctx2, layer_num, block_lines, block_power, f"{batches[1].batch_id}.1", 'BATCH_2')
-            _emit_pre_attn_layers(ctx, bctx2, layer_num + 1, block_lines, block_power, 'BATCH_2')
+        # Batch2: post_attn(current) + pre_attn(next)
+        _emit_post_attn_layers(
+            ctx, bctx2, layer_num, block_lines, block_power,
+            f"{batches[1].batch_id}.1", 'BATCH_2')
+        _emit_pre_attn_layers(
+            ctx, bctx2, layer_num + 1, block_lines, block_power, 'BATCH_2')
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
-                f.writelines(block_lines)
+        # MoE blocks are only safely replayable when the router opts into
+        # block copy.
+        can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
+        if can_copy:
+            for _ in range(copy_count):
+                records.extend(block_lines)
                 block_power.flush(ctx, enable_attn_offloading)
+        else:
+            records.extend(block_lines)
+            block_power.flush(ctx, enable_attn_offloading)
 
-        # EPILOGUE: last layer post_attn + final layers
-        last_lines = []
-        last_power = PowerAccumulator([], [], 0, 0)
-        _emit_post_attn_layers(ctx, bctx1, num_layers - 1, last_lines, last_power, f"{batches[0].batch_id}.0", 'BATCH_1')
-        f.writelines(last_lines)
-        last_power.flush(ctx, enable_attn_offloading)
-        _emit_final_layers(ctx, bctx1, f, 'BATCH_1')
+    # EPILOGUE: last layer post_attn + final layers
+    last_lines = []
+    last_power = PowerAccumulator([], [], 0, 0)
+    _emit_post_attn_layers(
+        ctx, bctx1, num_layers - 1, last_lines, last_power,
+        f"{batches[0].batch_id}.0", 'BATCH_1')
+    records.extend(last_lines)
+    last_power.flush(ctx, enable_attn_offloading)
+    _emit_final_layers(ctx, bctx1, records, 'BATCH_1')
 
-        last_lines2 = []
-        last_power2 = PowerAccumulator([], [], 0, 0)
-        _emit_post_attn_layers(ctx, bctx2, num_layers - 1, last_lines2, last_power2, f"{batches[1].batch_id}.1", 'BATCH_2')
-        f.writelines(last_lines2)
-        last_power2.flush(ctx, enable_attn_offloading)
-        _emit_final_layers(ctx, bctx2, f, 'BATCH_2')
+    last_lines2 = []
+    last_power2 = PowerAccumulator([], [], 0, 0)
+    _emit_post_attn_layers(
+        ctx, bctx2, num_layers - 1, last_lines2, last_power2,
+        f"{batches[1].batch_id}.1", 'BATCH_2')
+    records.extend(last_lines2)
+    last_power2.flush(ctx, enable_attn_offloading)
+    _emit_final_layers(ctx, bctx2, records, 'BATCH_2')
 
-        _emit_pp_pd_power(ctx, bctx1)
+    _emit_pp_pd_power(ctx, bctx1)
 
 
 # ======================================================================
@@ -1445,13 +1767,14 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 # ======================================================================
 
 # Wrapper function that creates trace for an instance
+@timed_stage("trace_generation")
 def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_type=None, node_id=0, instance_id=0,
                    max_num_batched_tokens=2048, max_num_seqs=None,
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
                    tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
-                   kv_offload_cpu=False):
+                   kv_offload_cpu=False, materialize=True, render_text=True):
 
     model = batch.model
 
@@ -1465,7 +1788,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
         inputs_root, "trace", hardware, batch.model,
         f"instance{instance_id}_batch{batch.batch_id}.txt",
     )
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    if materialize:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     if batch.kind in {BatchKind.KV_EVICT, BatchKind.KV_RELOAD}:
         if not kv_offload_cpu:
@@ -1487,19 +1811,42 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                 str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
             migration_size = load_size
 
-        with open(output_path, 'w') as f:
-            f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
-            f.write('1\n')
-            f.write(header())
-            f.write(formatter(*operation))
+        runtime_trace = RuntimeTraceSnapshot.from_records(
+            f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}",
+            (RuntimeTraceRow(
+                name=operation[0],
+                comp_time=int(operation[1]),
+                input_loc=operation[2],
+                input_size=int(operation[3]),
+                weight_loc=operation[4],
+                weight_size=int(operation[5]),
+                output_loc=operation[6],
+                output_size=int(operation[7]),
+                comm_type=operation[8],
+                comm_size=int(operation[9]),
+                misc=operation[10],
+            ),),
+        )
+        trace_text = runtime_trace.render() if render_text or materialize else None
+        if materialize:
+            with open(output_path, 'w') as f:
+                f.write(trace_text)
 
         if power_model is not None:
             power_model.reset_log()
             power_model.add_dram_energy_consumption(node_id, migration_size)
             power_model.print_log(node_id)
-        return
+        return GeneratedTrace(
+            output_path, trace_text, materialize,
+            runtime_trace=runtime_trace)
 
-    config = get_config(model)
+    config_cache_before = get_config.cache_info()
+    with measure_active("model_config_lookup"):
+        config = get_config(model)
+    if get_config.cache_info().misses > config_cache_before.misses:
+        increment_active("model_config_cache_misses")
+    else:
+        increment_active("model_config_cache_hits")
     fp = fp // 8  # bit -> byte of floating point
     max_len = min(max_num_batched_tokens, config['max_position_embeddings'])
     variant = resolve_variant(dtype, kv_cache_dtype, config)
@@ -1536,66 +1883,72 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
                         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
-    if not enable_sub_batch_interleaving:
-        _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
-    else:
-        batches = _make_sub_batch(batch)
-        if len(batches) < 2 or len(batches[0].requests) == 0 or len(batches[1].requests) == 0:
-            _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
+    runtime_records = []
+    with measure_active("trace_synthesis"):
+        if not enable_sub_batch_interleaving:
+            _synthesize_trace(
+                *synth_args, batch, max_len, runtime_records,
+                **synth_kwargs)
         else:
-            _synthesize_interleaved_trace(*synth_args, batches, max_len, output_path, **synth_kwargs)
-
-    with open(output_path, 'r') as f:
-        dic = []
-        for line in f.readlines():
-            split = re.findall(r'\S+', line)
-            dic.append(split)
+            batches = _make_sub_batch(batch)
+            if len(batches) < 2 or len(batches[0].requests) == 0 or len(batches[1].requests) == 0:
+                _synthesize_trace(
+                    *synth_args, batch, max_len, runtime_records,
+                    **synth_kwargs)
+            else:
+                _synthesize_interleaved_trace(
+                    *synth_args, batches, max_len, runtime_records,
+                    **synth_kwargs)
 
     # vllm: open output txt file and add load, evict mem
-    mem = []
+    memory_records = []
     # Phase-1 KV offloading always targets the node's CPU DRAM. Do not let a
     # placement ``kv_evict_loc`` redirect this live-KV swap to CXL.
     kv_evict_loc = f"REMOTE:{node_id}" if kv_offload_cpu else get_device(
         placement, None, None, 'kv_evict_loc')
     if load_size != 0:
-        load = ["kv_load", '0', 'LOCAL', '0', kv_evict_loc, str(load_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
-        mem.append(load)
+        memory_records.append(RuntimeTraceRow(
+            "kv_load", 0, "LOCAL", 0, kv_evict_loc, load_size,
+            "LOCAL", 0, "NONE", 0, "NONE"))
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, load_size)
     if evict_size != 0:
-        evict = ["kv_evict", '0', 'LOCAL', '0', kv_evict_loc, str(evict_size), 'LOCAL', '0', 'NONE', '0', 'NONE']
-        mem.append(evict)
+        memory_records.append(RuntimeTraceRow(
+            "kv_evict", 0, "LOCAL", 0, kv_evict_loc, evict_size,
+            "LOCAL", 0, "NONE", 0, "NONE"))
         if power_model is not None:
             power_model.add_dram_energy_consumption(node_id, evict_size)
 
     if power_model is not None:
         power_model.print_log(node_id)
 
-    result = mem + dic
+    result = memory_records + runtime_records
 
-    with open(output_path, 'w') as f:
-        # instance type
-        if pd_type == None:
-            instance_type = 'COLOCATED'
-        elif pd_type == 'prefill':
-            instance_type = 'PREFILL'
-        elif pd_type == 'decode':
-            instance_type = 'DECODE'
-        else:
-            raise ValueError(f"Unknown instance type {pd_type}.")
+    # instance type
+    if pd_type == None:
+        instance_type = 'COLOCATED'
+    elif pd_type == 'prefill':
+        instance_type = 'PREFILL'
+    elif pd_type == 'decode':
+        instance_type = 'DECODE'
+    else:
+        raise ValueError(f"Unknown instance type {pd_type}.")
 
-        f.write(f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}\n")
-        f.write(str(len(result))+'\n')
-        f.write(header())
-
-        # add layer_number at the end of the layer_name
-        for i in range(0, len(result)):
-            if "EXPERT" not in result[i][0] and "PIM" not in result[i][0]:
-                new_string = f'{result[i][0]}_{i}'
-                f.write(formatter(new_string, *result[i][1:]))
-            else:
-                f.write(formatter(' '.join(result[i]),'','','','','','','','','',''))
-    return
+    runtime_trace = RuntimeTraceSnapshot.from_records(
+        f"{instance_type}\t\tmodel_parallel_NPU_group: {pp_size}",
+        _number_runtime_records(result),
+    )
+    trace_text = None
+    if render_text or materialize:
+        with measure_active("text_trace_rendering"):
+            trace_text = runtime_trace.render()
+    if materialize:
+        with measure_active("text_trace_file_write"):
+            with open(output_path, 'w') as f:
+                f.write(trace_text)
+    return GeneratedTrace(
+        output_path, trace_text, materialize,
+        runtime_trace=runtime_trace)
 
 
 # ======================================================================
@@ -1604,6 +1957,7 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
 
 
 # generate event for first request arrival
+@timed_stage("event_trace_generation")
 def generate_event(alarm, inputs_root=None):
 
     # make inputs for text file

@@ -1,5 +1,6 @@
 import bisect
 import json
+import os
 import random
 from .logger import get_logger
 from .request import KVResidency
@@ -48,6 +49,25 @@ class Router:
         self._request_to_session = {}    # request_id -> (session_id, sub_request_index)
         self._session_schedulers = {}    # session_id -> affinity scheduler
         self._next_request_id = 0        # monotonic counter for unique request IDs
+        self._agentic_session_count = 0
+        self._agentic_turn_count = 0
+        self._terminal_session_count = 0
+        self._live_sessions = set()
+        self._tool_gap_count = 0
+        self._tool_gap_duration_ns = 0
+
+        # Time-weighted realized-concurrency accounting. Counts are sampled
+        # at simulation events and integrated over simulated time.
+        self._concurrency_origin_ns = None
+        self._concurrency_time_ns = None
+        self._live_session_area_ns = 0
+        self._runnable_request_area_ns = 0
+        self._peak_live_sessions = 0
+        self._peak_runnable_requests = 0
+        self._last_live_sessions = 0
+        self._last_runnable_requests = 0
+        self._all_idle_interval_count = 0
+        self._all_idle_duration_ns = 0
 
         if self.routing_policy == "RR":
             self._select_instance = self._rr_select
@@ -125,7 +145,8 @@ class Router:
         pending queue. Subsequent sub-requests are released dynamically
         via notify_request_completed() when predecessors finish.
         """
-        path = f'../{path}'
+        if not os.path.isabs(path):
+            path = os.path.join('..', path)
         self._enable_prefix_caching = enable_prefix_caching
         self._is_init = is_init
         loaded_lines = 0
@@ -207,6 +228,8 @@ class Router:
             'reused_prefix_toks': reused_prefix_toks,
             'retain_for_next': retain_for_next,
         }
+        self._agentic_session_count += 1
+        self._agentic_turn_count += len(sub_reqs)
 
         # Queue the first sub-request
         first = sub_reqs[0]
@@ -245,6 +268,9 @@ class Router:
                 break
 
             session_id = req_data.get('session_id')
+            if (session_id is not None and
+                    req_data.get('sub_request_index') == 0):
+                self._live_sessions.add(session_id)
             sched = self._session_schedulers.get(session_id)
             if (sched is not None and sched.pd_type == "prefill" and
                     self._pd_session_cpu_bridge_pending(session_id)):
@@ -345,6 +371,9 @@ class Router:
         release_time_ns = completion_time_ns + tool_duration_ns
 
         if next_idx < len(sub_reqs):
+            if tool_duration_ns > 0:
+                self._tool_gap_count += 1
+                self._tool_gap_duration_ns += tool_duration_ns
             # Release next sub-request
             next_sub = sub_reqs[next_idx]
             next_id = base_id + next_idx
@@ -372,6 +401,8 @@ class Router:
             # Session complete — all sub-requests have been released
             del self._deferred_sessions[session_id]
             self._session_schedulers.pop(session_id, None)
+            self._live_sessions.discard(session_id)
+            self._terminal_session_count += 1
 
     def _insert_pending_sorted(self, req_data):
         """Insert a request into _pending_requests maintaining arrival-time
@@ -392,11 +423,83 @@ class Router:
         """Check if there are agentic sessions with unreleased sub-requests."""
         return bool(self._deferred_sessions)
 
+    @property
+    def terminal_session_count(self):
+        return self._terminal_session_count
+
     def get_next_pending_arrival(self):
         """Return the next pending request's arrival time, or None."""
         if self._pending_idx < len(self._pending_requests):
             return self._pending_requests[self._pending_idx]['arrival_time_ns']
         return None
+
+    def _count_runnable_requests(self, current_time_ns):
+        pending = sum(
+            request['arrival_time_ns'] <= current_time_ns
+            for request in self._pending_requests[self._pending_idx:]
+        )
+        waiting = 0
+        running = 0
+        handoffs = 0
+        for scheduler in self.schedulers:
+            waiting += sum(
+                request.arrival <= current_time_ns
+                for request in scheduler.request
+            )
+            running += sum(
+                len(batch.requests) for batch in scheduler.inflight)
+            handoffs += len(getattr(scheduler, 'pending_pd_handoffs', ()))
+        return pending + waiting + running + handoffs
+
+    def observe_concurrency(self, current_time_ns):
+        """Integrate realized session/request concurrency at an event time."""
+        now = int(current_time_ns)
+        if self._concurrency_time_ns is None:
+            self._concurrency_origin_ns = now
+            self._concurrency_time_ns = now
+        if now < self._concurrency_time_ns:
+            now = self._concurrency_time_ns
+        elapsed = now - self._concurrency_time_ns
+        self._live_session_area_ns += self._last_live_sessions * elapsed
+        self._runnable_request_area_ns += self._last_runnable_requests * elapsed
+        if self._last_live_sessions > 0 and self._last_runnable_requests == 0:
+            self._all_idle_duration_ns += elapsed
+
+        live = len(self._live_sessions)
+        runnable = self._count_runnable_requests(now)
+        was_all_idle = (
+            self._last_live_sessions > 0 and
+            self._last_runnable_requests == 0
+        )
+        if live > 0 and runnable == 0 and not was_all_idle:
+            self._all_idle_interval_count += 1
+        self._peak_live_sessions = max(self._peak_live_sessions, live)
+        self._peak_runnable_requests = max(
+            self._peak_runnable_requests, runnable)
+        self._last_live_sessions = live
+        self._last_runnable_requests = runnable
+        self._concurrency_time_ns = now
+
+    def concurrency_summary(self, current_time_ns):
+        self.observe_concurrency(current_time_ns)
+        observed_duration = max(
+            0, self._concurrency_time_ns - self._concurrency_origin_ns)
+        denominator = observed_duration or 1
+        return {
+            'agentic_sessions': self._agentic_session_count,
+            'agentic_turns': self._agentic_turn_count,
+            'terminal_sessions': self._terminal_session_count,
+            'peak_live_sessions': self._peak_live_sessions,
+            'mean_live_sessions': self._live_session_area_ns / denominator,
+            'peak_runnable_requests': self._peak_runnable_requests,
+            'mean_runnable_requests': (
+                self._runnable_request_area_ns / denominator),
+            'all_idle_interval_count': self._all_idle_interval_count,
+            'all_idle_duration_ns': self._all_idle_duration_ns,
+            'tool_gap_count': self._tool_gap_count,
+            'tool_gap_duration_ns': self._tool_gap_duration_ns,
+            'observed_duration_ns': observed_duration,
+        }
 
     # -----------------------------------------------------------------------
     # Legacy: upfront routing (kept for backward compat)

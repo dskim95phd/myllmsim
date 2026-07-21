@@ -9,9 +9,12 @@ spawns the ASTRA-Sim subprocess, and runs the iteration loop:
 import os
 import subprocess
 import argparse
+from collections import deque
+import hashlib
 import json
 import shutil
-from time import time
+import tempfile
+from time import perf_counter, time
 from collections import defaultdict
 
 from serving.core.scheduler import *
@@ -27,6 +30,16 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.host_timing import HostTimingRecorder
+from serving.core.chakra_template import (
+    BoundedTemplateCache,
+    ChakraTemplateBundle,
+    RuntimeTraceSnapshot,
+)
+from serving.core.workload_transport import (
+    FileWorkloadTransport,
+    IpcFileWorkloadTransport,
+)
 import sys as flush
 
 from pyinstrument import Profiler
@@ -81,6 +94,24 @@ def _resolve_output_file(path, run_id):
     if path is None:
         return None
     return path.replace("{run_id}", run_id)
+
+
+def _workload_ipc_socket_path(run_id):
+    name = f"llmservingsim-{run_id}.sock"
+    path = os.path.join(tempfile.gettempdir(), name)
+    if len(os.fsencode(path)) <= 100:
+        return path
+    digest = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:20]
+    return os.path.join(tempfile.gettempdir(), f"llmservingsim-{digest}.sock")
+
+
+def _read_chakra_graph_bundle(workload_prefix, system_ids):
+    graphs = {}
+    for system_id in system_ids:
+        graph_path = f"{workload_prefix}.{system_id}.et"
+        with open(graph_path, "rb") as graph_file:
+            graphs[system_id] = graph_file.read()
+    return graphs
 
 
 def _kv_offload_output_file(path):
@@ -308,6 +339,7 @@ def _validate_kv_offload_node_scope(instances, runtime_configs, prefix_storage):
 
 
 def main():
+    process_start = perf_counter()
     # ----------------------------------------------------------------------------------------------
     # LLMServingSim runs in astra-sim directory for easy path configuration
     # your relative path should start from astra-sim directory
@@ -426,13 +458,42 @@ def main():
                         help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
+    parser.add_argument('--chakra-converter', choices=['in-process', 'subprocess'], default='in-process',
+                        help='Chakra conversion mode. in-process avoids launching a Python interpreter for every batch; '
+                        'subprocess preserves the legacy reference path')
+    parser.add_argument('--workload-transport', choices=['file', 'ipc'], default=None,
+                        help='ASTRA-Sim workload control transport. Defaults to ipc for analytical and file for ns3. '
+                        'file preserves the legacy stdin/path workflow; ipc sends framed commands over a run-specific Unix domain socket')
+    parser.add_argument('--ipc-execution', choices=['direct', 'oracle'], default='direct',
+                        help='execution mode used with --workload-transport ipc. direct executes the '
+                        'prepared in-memory iteration; oracle materializes and converts every batch '
+                        'before extracting a full-graph patch for correctness comparison')
+    parser.add_argument('--template-cache-capacity', type=int, default=64,
+                        help='maximum number of shape-keyed compute templates retained by '
+                        'the serving frontend (default: 64; must be positive)')
+    parser.add_argument('--host-timing-output', type=str, default=None,
+                        help='optional JSON output for host-side stage timings and counters. '
+                        'Supports the {run_id} placeholder')
 
     args = parser.parse_args()
+    if args.template_cache_capacity <= 0:
+        parser.error('--template-cache-capacity must be positive')
+    if args.workload_transport is None:
+        args.workload_transport = (
+            'ipc' if args.network_backend == 'analytical' else 'file')
     
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
     args.output = _resolve_output_file(args.output, args.run_id)
+    args.host_timing_output = _resolve_output_file(
+        args.host_timing_output, args.run_id)
+    args.workload_ipc_socket = (
+        _workload_ipc_socket_path(args.run_id)
+        if args.workload_transport == "ipc" else None
+    )
+    host_timing = HostTimingRecorder()
+    host_timing.record_rss_checkpoint("frontend_initialized")
 
     configure_logger(level=args.log_level)
     logger = get_logger("Main")
@@ -463,6 +524,14 @@ def main():
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
     instances = cluster["instances"]
+    if (args.workload_transport == "file" and
+            any(instance.get("dp_group") is not None
+                for instance in instances)):
+        raise ValueError(
+            "Cross-instance DP+EP requires atomic wave submission. Use "
+            "--workload-transport ipc --ipc-execution oracle for a fully "
+            "materialized Chakra correctness run, or --ipc-execution direct "
+            "for template execution.")
     inst2node_mapping = cluster["inst2node_mapping"]
     inst2npu_mapping = cluster["inst2npu_mapping"]
     npu2inst_mapping = cluster["npu2inst_mapping"]
@@ -495,6 +564,8 @@ def main():
         binary=os.path.join(astra_sim, "extern/network_backend/ns-3/build/scratch/ns3.42-AstraSimNetwork-default")
     else:
         raise NotImplementedError("Only analytical and ns3 network backend are supported")
+    if args.workload_transport == "ipc" and network_backend != "analytical":
+        raise ValueError("IPC workload transport currently supports only the analytical backend.")
     memory=run_paths.memory_config
     system=run_paths.system_config
     # ------------------------------------- Prepare simulation -------------------------------------
@@ -634,7 +705,7 @@ def main():
         ))
 
     # Controller for astra-sim process communication
-    controller = Controller(total_npu)
+    controller = Controller(total_npu, host_timing=host_timing)
     # Global Request Router
     router = Router(
         num_instances, schedulers, num_req, request_routing_policy,
@@ -684,10 +755,13 @@ def main():
         event_time = first_arival_time
     else:
         event_time = INTERVAL
-    generate_event(int(event_time), inputs_root=run_paths.inputs_root)
+    generate_event(int(event_time), inputs_root=run_paths.inputs_root,
+                   host_timing=host_timing)
     # Make Chakra Grapth
     generate_graph(None, None, total_npu, event=True, inputs_root=run_paths.inputs_root,
-                   cleanup_trace=args.cleanup_inputs)
+                   cleanup_trace=args.cleanup_inputs,
+                   converter_mode=args.chakra_converter,
+                   host_timing=host_timing)
     # set first workload file
     workload = get_workload(None, None, event=True, inputs_root=run_paths.inputs_root)
     # run subprocess
@@ -698,7 +772,91 @@ def main():
         astra_args.append("--end-npu-ids="+end_npu_ids)
     if network_backend == 'ns3':
         astra_args.append("--logical-topology-configuration="+astra_sim+"/inputs/logical_topology/logical_8nodes_1D.json")
+    if args.workload_ipc_socket is not None:
+        astra_args.append("--workload-ipc-socket="+args.workload_ipc_socket)
+    host_timing.record_rss_checkpoint("before_backend_start")
     p = subprocess.Popen(astra_args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    host_timing.record_rss_checkpoint("backend_started", backend_pid=p.pid)
+    if args.workload_transport == "ipc":
+        workload_transport = IpcFileWorkloadTransport(
+            args.workload_ipc_socket, process=p, host_timing=host_timing)
+        event_graphs = _read_chakra_graph_bundle(
+            workload, range(total_npu))
+        workload_transport.register_template("event-handler", event_graphs)
+        host_timing.record_rss_checkpoint(
+            "event_template_registered", backend_pid=p.pid)
+    else:
+        workload_transport = FileWorkloadTransport(
+            controller, p, host_timing=host_timing)
+    registered_compute_templates = BoundedTemplateCache(
+        args.template_cache_capacity)
+    registered_template_ids = {}
+    compute_template_rss_recorded = False
+    session_rss_thresholds = (10, 50, 100, 300)
+    recorded_session_rss_thresholds = set()
+
+    def record_compute_template_rss():
+        nonlocal compute_template_rss_recorded
+        if compute_template_rss_recorded:
+            return
+        host_timing.record_rss_checkpoint(
+            "compute_template_registered", backend_pid=p.pid)
+        compute_template_rss_recorded = True
+
+    def record_session_rss():
+        completed = router.terminal_session_count
+        for threshold in session_rss_thresholds:
+            if (completed >= threshold and
+                    threshold not in recorded_session_rss_thresholds):
+                host_timing.record_rss_checkpoint(
+                    f"terminal_sessions_{threshold}",
+                    backend_pid=p.pid,
+                    metadata={"terminal_sessions": completed},
+                )
+                recorded_session_rss_thresholds.add(threshold)
+
+    def get_compute_template(cache_key):
+        if cache_key is None:
+            return None
+        return registered_compute_templates.get(cache_key)
+
+    def cache_compute_template(cache_key, template):
+        if cache_key is None:
+            return
+        evicted = registered_compute_templates.put(cache_key, template)
+        if evicted is not None:
+            host_timing.increment("template_cache_evictions")
+            _, (_, evicted_template) = evicted
+            evicted_trace = evicted_template.runtime_trace
+            evicted_class = (
+                evicted_trace.template_class
+                if evicted_trace is not None else "unknown")
+            host_timing.increment(
+                f"template_cache_evictions_{evicted_class}")
+    completion_driven = False
+    direct_submission_started = False
+    bootstrap_systems_remaining = {
+        int(value)
+        for encoded in (start_npu_ids, end_npu_ids)
+        for value in encoded.split(',')
+        if value.strip()
+    }
+    ready_systems = deque()
+    queued_ready_systems = set()
+    last_astra_iteration = {system_id: 0 for system_id in range(total_npu)}
+
+    def queue_ready_system(system_id):
+        if system_id not in queued_ready_systems:
+            ready_systems.append(system_id)
+            queued_ready_systems.add(system_id)
+            logger.debug("Queued logical wake-up for NPU[%d]", system_id)
+
+    def instance_end_system(instance_id):
+        instance = instances[instance_id]
+        system_count = instance["num_npus"]
+        if instance["pd_type"] == "prefill":
+            system_count *= 2
+        return inst2npu_mapping[instance_id] + system_count - 1
 
     # DP group synchronization: defer trace generation until all members have scheduled
     # dp_groups maps dp_group_name -> list of instance_ids
@@ -714,20 +872,307 @@ def main():
             inst_dp_group[inst_id] = dg
     # Pending batches per DP group (waiting for all members to schedule)
     dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
+    # Direct waves include dummy batches that are intentionally absent from
+    # Scheduler.inflight. Track physical completions separately so an idle
+    # peer is not rescheduled or put to sleep before its wave has completed.
+    dp_active_systems = {dg: set() for dg in dp_groups}
     # Pre-generated workloads ready to submit on next "Waiting"
     dp_ready_workloads = {}  # instance_id -> workload_path
+    next_wave_id = 1
+
+    def record_dp_system_completion(system_id):
+        completed_instance_id = npu2inst_mapping[system_id]
+        completed_dp_group = inst_dp_group.get(completed_instance_id)
+        if completed_dp_group is None:
+            return
+        dp_active_systems[completed_dp_group].discard(system_id)
+        completed_start = inst2npu_mapping[completed_instance_id]
+        completed_end = instance_end_system(completed_instance_id) + 1
+        member_still_active = any(
+            active_system in dp_active_systems[completed_dp_group]
+            for active_system in range(completed_start, completed_end)
+        )
+        if (dp_pending[completed_dp_group] and
+                not member_still_active):
+            queue_ready_system(completed_start)
+
+    def submit_dp_wave(dp_group, responder_instance_id):
+        """Submit one complete DP wave through the selected execution path."""
+        nonlocal direct_submission_started, next_wave_id
+
+        pending = dp_pending[dp_group]
+        if len(pending) != len(dp_groups[dp_group]):
+            raise RuntimeError(
+                f"DP group {dp_group} is incomplete: "
+                f"{len(pending)}/{len(dp_groups[dp_group])} participants")
+
+        max_total_len = max(batch.total_len for batch, _ in pending.values())
+        for batch, _ in pending.values():
+            _pad_batch_to_max(batch, max_total_len)
+
+        first_instance_id = dp_groups[dp_group][0]
+        first_batch = pending[first_instance_id][0]
+        workload_name = (
+            f'{instances[first_instance_id]["hardware"]}/'
+            f'{instances[first_instance_id]["model_name"]}/'
+            f'dp_{dp_group}_batch{first_batch.batch_id}'
+        )
+        prepared_execution = args.workload_transport == "ipc"
+        direct_patch_mode = (
+            prepared_execution and args.ipc_execution == "direct")
+
+        if prepared_execution:
+            wave_runs = []
+            # Preserve the legacy wave's deterministic launch order: the
+            # controller that completed the barrier fires first, followed by
+            # its peers. Equal-timestamp collective callbacks can otherwise
+            # differ by a few cycles even though the graph is identical.
+            wave_member_ids = [responder_instance_id] + [
+                member_instance_id
+                for member_instance_id in dp_groups[dp_group]
+                if member_instance_id != responder_instance_id
+            ]
+            for member_instance_id in wave_member_ids:
+                batch, member_node_id = pending[member_instance_id]
+                member = instances[member_instance_id]
+                member_config = instance_runtime_configs[member_instance_id]
+                generated_trace = generate_trace(
+                    batch, member["hardware"], member["tp_size"],
+                    member["pp_size"], member["local_ep"],
+                    member["ep_total"], member["pd_type"], member_node_id,
+                    member_instance_id,
+                    member_config["max_num_batched_tokens"],
+                    member_config["max_num_seqs"],
+                    placement[member_instance_id],
+                    block_mode_on[member_instance_id],
+                    expert_routing_policy,
+                    member_config["enable_prefix_caching"],
+                    member_config["enable_attn_offloading"], power_model,
+                    pim_models[member_node_id],
+                    member_config["enable_sub_batch_interleaving"],
+                    member_config["fp"], dtype=member_config["dtype"],
+                    kv_cache_dtype=member_config["kv_cache_dtype"],
+                    tp_dim=member.get("tp_dim"),
+                    ep_dim=member.get("ep_dim"),
+                    dp_sum_total_len=max_total_len,
+                    enable_block_copy=member_config["enable_block_copy"],
+                    inputs_root=run_paths.inputs_root,
+                    kv_offload_cpu=member_config["enable_kv_offloading"],
+                    host_timing=host_timing,
+                    materialize=not direct_patch_mode,
+                    render_text=not direct_patch_mode,
+                )
+                trace_structure = generated_trace.runtime_trace
+                if trace_structure is None:
+                    with host_timing.measure("runtime_trace_parsing"):
+                        trace_structure = RuntimeTraceSnapshot.parse(
+                            generated_trace.ensure_text())
+                template_cache_key = (
+                    member_instance_id, trace_structure.structure_key)
+                registered_template = get_compute_template(
+                    template_cache_key)
+                cache_result = (
+                    "hits" if registered_template is not None else "misses")
+                host_timing.increment(f"template_cache_{cache_result}")
+                host_timing.increment(
+                    f"template_cache_{cache_result}_"
+                    f"{trace_structure.template_class}")
+
+                patch = None
+                if (direct_patch_mode and
+                        registered_template is not None and
+                        registered_template[1].supports_trace_patch):
+                    template_id, template = registered_template
+                    try:
+                        with host_timing.measure("batch_patch_generation"):
+                            patch = template.build_patch_from_snapshot(
+                                template_id, batch.batch_id,
+                                trace_structure, host_timing=host_timing)
+                        host_timing.increment("direct_trace_patches")
+                        host_timing.increment("trace_files_skipped")
+                        host_timing.increment("chakra_graphs_skipped")
+                    except ValueError as error:
+                        logger.warning(
+                            "Direct DP trace patch fallback for instance %d: %s",
+                            member_instance_id, error)
+                        host_timing.increment("direct_trace_patch_fallbacks")
+
+                if patch is None:
+                    generated_trace = materialize_generated_trace(
+                        generated_trace)
+                    generate_graph(
+                        batch, member["hardware"], member["num_npus"],
+                        member_node_id, member_instance_id,
+                        inst2npu_mapping[member_instance_id],
+                        member_config["enable_local_offloading"],
+                        workload_name=workload_name,
+                        inputs_root=run_paths.inputs_root,
+                        cleanup_trace=args.cleanup_inputs,
+                        converter_mode=args.chakra_converter,
+                        host_timing=host_timing,
+                    )
+                    workload = get_workload(
+                        batch, member["hardware"], member_instance_id,
+                        workload_name=workload_name,
+                        inputs_root=run_paths.inputs_root,
+                    )
+                    first_system = inst2npu_mapping[member_instance_id]
+                    system_ids = range(
+                        first_system,
+                        first_system + member["num_npus"],
+                    )
+                    graphs = _read_chakra_graph_bundle(workload, system_ids)
+                    if registered_template is None:
+                        template = ChakraTemplateBundle(
+                            f"instance-{member_instance_id}-"
+                            f"{trace_structure.structure_key}",
+                            graphs, runtime_trace=trace_structure,
+                            host_timing=host_timing,
+                        )
+                        template_id = registered_template_ids.get(
+                            template_cache_key)
+                        if template_id is None:
+                            template_id = workload_transport.register_template(
+                                template.template_key, graphs,
+                                bindings=template.bindings,
+                            )
+                            registered_template_ids[
+                                template_cache_key] = template_id
+                            record_compute_template_rss()
+                            host_timing.increment(
+                                f"template_registrations_"
+                                f"{trace_structure.template_class}")
+                        else:
+                            host_timing.increment(
+                                "template_cache_rehydrations")
+                            host_timing.increment(
+                                f"template_cache_rehydrations_"
+                                f"{trace_structure.template_class}")
+                        registered_template = (template_id, template)
+                        cache_compute_template(
+                            template_cache_key, registered_template)
+                    template_id, template = registered_template
+                    with host_timing.measure("batch_patch_generation"):
+                        patch = template.build_patch(
+                            template_id, batch.batch_id, graphs)
+
+                wave_runs.append((member_instance_id, patch))
+
+            wave_id = next_wave_id
+            workload_transport.prepare_wave(wave_id, wave_runs)
+            dp_active_systems[dp_group] = {
+                system.system_id
+                for _, patch in wave_runs
+                for system in patch.systems
+            }
+            next_wave_id += 1
+            direct_submission_started = True
+            pending.clear()
+            return
+
+        for member_instance_id in dp_groups[dp_group]:
+            batch, member_node_id = pending[member_instance_id]
+            member = instances[member_instance_id]
+            member_config = instance_runtime_configs[member_instance_id]
+            generate_trace(
+                batch, member["hardware"], member["tp_size"],
+                member["pp_size"], member["local_ep"], member["ep_total"],
+                member["pd_type"], member_node_id, member_instance_id,
+                member_config["max_num_batched_tokens"],
+                member_config["max_num_seqs"],
+                placement[member_instance_id], block_mode_on[member_instance_id],
+                expert_routing_policy,
+                member_config["enable_prefix_caching"],
+                member_config["enable_attn_offloading"], power_model,
+                pim_models[member_node_id],
+                member_config["enable_sub_batch_interleaving"],
+                member_config["fp"], dtype=member_config["dtype"],
+                kv_cache_dtype=member_config["kv_cache_dtype"],
+                tp_dim=member.get("tp_dim"), ep_dim=member.get("ep_dim"),
+                dp_sum_total_len=max_total_len,
+                enable_block_copy=member_config["enable_block_copy"],
+                inputs_root=run_paths.inputs_root,
+                kv_offload_cpu=member_config["enable_kv_offloading"],
+                host_timing=host_timing,
+            )
+            generate_graph(
+                batch, member["hardware"], member["num_npus"],
+                member_node_id, member_instance_id,
+                inst2npu_mapping[member_instance_id],
+                member_config["enable_local_offloading"],
+                workload_name=workload_name,
+                inputs_root=run_paths.inputs_root,
+                cleanup_trace=args.cleanup_inputs,
+                converter_mode=args.chakra_converter,
+                host_timing=host_timing,
+            )
+        responder_batch = pending[responder_instance_id][0]
+        responder = instances[responder_instance_id]
+        workload = get_workload(
+            responder_batch, responder["hardware"], responder_instance_id,
+            workload_name=workload_name, inputs_root=run_paths.inputs_root)
+        wave_systems = []
+        wave_member_ids = [responder_instance_id] + [
+            member_instance_id
+            for member_instance_id in dp_groups[dp_group]
+            if member_instance_id != responder_instance_id
+        ]
+        for member_instance_id in wave_member_ids:
+            member = instances[member_instance_id]
+            member_start = inst2npu_mapping[member_instance_id]
+            member_end = instance_end_system(member_instance_id)
+            wave_systems.extend(range(member_start, member_end + 1))
+            member_batch = pending[member_instance_id][0]
+            for submitted_system in range(member_start, member_end + 1):
+                if submitted_system not in member_batch.fired:
+                    member_batch.fired.append(submitted_system)
+        workload_transport.run_wave(workload, wave_systems)
+        dp_active_systems[dp_group] = set(wave_systems)
+        pending.clear()
 
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
     while True:
-        
-        out = controller.read_wait(p)
-        out_dict = controller.parse_output(out[-2])
+        reported_completion = False
+        if ready_systems:
+            ready_system = ready_systems.popleft()
+            queued_ready_systems.discard(ready_system)
+            logger.debug("Processing logical wake-up for NPU[%d]", ready_system)
+            out_dict = {
+                'sys': ready_system,
+                'id': last_astra_iteration[ready_system],
+                'cycle': current,
+            }
+        elif completion_driven:
+            completion = workload_transport.wait_batch_done()
+            reported_completion = True
+            out_dict = {
+                'sys': completion.system_id,
+                # Scheduler batch ids start at zero while ASTRA iteration
+                # zero belongs to the bootstrap event graph.
+                'id': completion.batch_id + 1,
+                'cycle': completion.cycles,
+            }
+            last_astra_iteration[completion.system_id] = out_dict['id']
+        else:
+            out = controller.read_wait(p)
+            out_dict = controller.parse_output(out[-2])
+            if out_dict is not None:
+                reported_completion = True
+                bootstrap_systems_remaining.discard(out_dict['sys'])
+                last_astra_iteration[out_dict['sys']] = out_dict['id']
+                logger.debug(
+                    "Bootstrap report from NPU[%d]; remaining=%s",
+                    out_dict['sys'], sorted(bootstrap_systems_remaining))
         
         if out_dict != None:
             sys = out_dict['sys']
             id = out_dict['id']
             current = out_dict['cycle']
+            router.observe_concurrency(current)
+            workload_transport.set_system(sys)
+            if reported_completion:
+                record_dp_system_completion(sys)
 
         # Hard expiry wins when it shares a timestamp with an arrival or a
         # migration completion.
@@ -751,7 +1196,15 @@ def main():
             waiting_request[instance_id] = True
 
         # check request is done
+        inflight_count_before_completion = len(
+            schedulers[instance_id].inflight)
         prompt_t, gen_t, finished_reqs = schedulers[instance_id].add_done(id, sys, current)
+        batch_completed = (
+            len(schedulers[instance_id].inflight) <
+            inflight_count_before_completion)
+        if (not bootstrap_systems_remaining and batch_completed and
+                sys != inst2npu_mapping[instance_id]):
+            queue_ready_system(inst2npu_mapping[instance_id])
         # add tokens in throughput
         prompt_th += prompt_t
         total_prompt += prompt_t
@@ -764,24 +1217,49 @@ def main():
         if instances[instance_id]["pd_type"] != "prefill":
             for req in finished_reqs:
                 router.notify_request_completed(req.id, current)
+            record_session_rss()
+            if (finished_reqs and not router.has_pending_requests() and
+                    not router.has_deferred_sessions()):
+                for idle_scheduler in schedulers:
+                    if (idle_scheduler.instance_id != instance_id and
+                            idle_scheduler.is_request_empty() and
+                            not idle_scheduler.inflight):
+                        queue_ready_system(inst2npu_mapping[
+                            idle_scheduler.instance_id])
 
         # Add prefill ended requests to decode instance
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
             router.transfer_prefill_request(finished_reqs, current)
+            for decode_id in decode_instance:
+                queue_ready_system(inst2npu_mapping[decode_id])
 
         # Apply batch completion and dependency-chain releases before routing
         # equal-time arrivals. This lets a zero-think-time PD continuation see
         # the CPU session record committed by a just-finished D2H migration.
-        if dataset is not None:
-            router.route_arrived_requests(current)
+        with host_timing.measure("scheduling_and_routing"):
+            if dataset is not None:
+                routed_requests = router.route_arrived_requests(current)
+                if routed_requests:
+                    for routed_scheduler in schedulers:
+                        if (routed_scheduler.instance_id != instance_id and
+                                not routed_scheduler.inflight and
+                                any(request.arrival <= current
+                                    for request in routed_scheduler.request)):
+                            queue_ready_system(inst2npu_mapping[
+                                routed_scheduler.instance_id])
 
-        # schedule requests
-        new_req = schedulers[instance_id].schedule(current, sys, id)
+            # schedule requests
+            new_req = schedulers[instance_id].schedule(current, sys, id)
+        if new_req is not None:
+            host_timing.observe("batch_size", len(new_req.requests))
+            host_timing.increment(
+                f"{new_req.kind.name.lower()}_batches")
+        router.observe_concurrency(current)
         responded = False  # track whether we already sent a response to ASTRA-Sim
 
         # Check if a pre-generated workload is ready for this instance (from DP sync)
         if new_req is None and instance_id in dp_ready_workloads:
-            controller.write_flush(p, dp_ready_workloads.pop(instance_id))
+            workload_transport.run_batch(dp_ready_workloads.pop(instance_id))
             responded = True
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
@@ -793,70 +1271,15 @@ def main():
                 logger.debug(f"Instance {instance_id} is idle but DP group {dg} has pending batches. Creating dummy batch for synchronization.")
                 dummy = Batch(schedulers[instance_id].get_batch_id(), instances[instance_id]["model_name"],
                               1, 1, [1], [], 0, 1, [], [], [1], current, 0)
+                host_timing.increment("dummy_batches")
                 dummy.fired.append(sys)
                 dp_pending[dg][instance_id] = (dummy, inst2node_mapping[instance_id])
 
                 if len(dp_pending[dg]) == len(dp_groups[dg]):
-                    # All DP members accounted for — pad every batch to the
-                    # group's max (vLLM CUDA-graph DP padding) and generate.
-                    config = get_config(instances[instance_id]["model_name"])
-                    max_total_len = max(b.total_len for b, _ in dp_pending[dg].values())
-                    for b, _ in dp_pending[dg].values():
-                        _pad_batch_to_max(b, max_total_len)
-                    # MoE AG/RS comm size is anchored to ``max_total_len``
-                    # (not ``max × group_size``). The trace generator divides
-                    # this by ep_total internally for the per-rank AG chunk
-                    # and uses the same value for the RS pre-scatter buffer.
-                    # Empirically this matches real NCCL AG/RS bandwidth on
-                    # PCIe 5.0 at the same ``link_bw`` that already calibrates
-                    # AllReduce — i.e. ASTRA-Sim's Ring half-duplex model
-                    # ends up correct for AR but 2× over real AG/RS, and the
-                    # "× group_size" we used previously stacked the two errors.
-                    sum_total_len = max_total_len
-
-                    # Shared workload folder for all DP members
-                    first_inst_id = dp_groups[dg][0]
-                    first_batch = dp_pending[dg][first_inst_id][0]
-                    dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
-
-                    for inst_id in dp_groups[dg]:
-                        batch, nid = dp_pending[dg][inst_id]
-                        inst = instances[inst_id]
-                        inst_cfg = instance_runtime_configs[inst_id]
-                        generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
-                                       inst["local_ep"], inst["ep_total"], inst["pd_type"],
-                                       nid, inst_id,
-                                       inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
-                                       placement[inst_id], block_mode_on[inst_id],
-                                       expert_routing_policy, inst_cfg["enable_prefix_caching"],
-                                       inst_cfg["enable_attn_offloading"],
-                                       power_model, pim_models[nid],
-                                       inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                       dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-                                       tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
-                                       dp_sum_total_len=sum_total_len,
-                                        enable_block_copy=inst_cfg["enable_block_copy"],
-                                        inputs_root=run_paths.inputs_root,
-                                        kv_offload_cpu=inst_cfg["enable_kv_offloading"])
-                        generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
-                                       inst_id, inst2npu_mapping[inst_id],
-                                       inst_cfg["enable_local_offloading"],
-                                       workload_name=dp_workload_name,
-                                       inputs_root=run_paths.inputs_root,
-                                       cleanup_trace=args.cleanup_inputs)
-                        if inst_id != instance_id:
-                            dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
-                                                                    workload_name=dp_workload_name,
-                                                                    inputs_root=run_paths.inputs_root)
-
-                    dp_pending[dg].clear()
-                    workload = get_workload(dummy, instances[instance_id]["hardware"], instance_id,
-                                            workload_name=dp_workload_name,
-                                            inputs_root=run_paths.inputs_root)
-                    controller.write_flush(p, workload)
+                    submit_dp_wave(dg, instance_id)
                     responded = True
                 else:
-                    controller.write_flush(p, "pass")
+                    workload_transport.pass_system()
                     responded = True
         # runnable batch exists
         elif new_req is not None:
@@ -874,66 +1297,36 @@ def main():
                     dp_pending[dg][instance_id] = (new_req, node_id)
 
                     if len(dp_pending[dg]) == len(dp_groups[dg]):
-                        # All DP members have scheduled — pad every batch to
-                        # the group's max (vLLM CUDA-graph DP padding) so
-                        # smaller batches gain dummy decodes that all layers
-                        # still compute over.
-                        config = get_config(instance["model_name"])
-                        max_total_len = max(b.total_len for b, _ in dp_pending[dg].values())
-                        for b, _ in dp_pending[dg].values():
-                            _pad_batch_to_max(b, max_total_len)
-                        # See twin block above: anchor MoE comm to max_total_len
-                        # (no group-size multiplier).
-                        sum_total_len = max_total_len
-
-                        # Shared workload folder for all DP members
-                        first_inst_id = dp_groups[dg][0]
-                        first_batch = dp_pending[dg][first_inst_id][0]
-                        dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
-
-                        for inst_id in dp_groups[dg]:
-                            batch, nid = dp_pending[dg][inst_id]
-                            inst = instances[inst_id]
-                            inst_cfg = instance_runtime_configs[inst_id]
-                            generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
-                                           inst["local_ep"], inst["ep_total"], inst["pd_type"],
-                                           nid, inst_id,
-                                           inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
-                                           placement[inst_id], block_mode_on[inst_id],
-                                           expert_routing_policy, inst_cfg["enable_prefix_caching"],
-                                           inst_cfg["enable_attn_offloading"],
-                                           power_model, pim_models[nid],
-                                           inst_cfg["enable_sub_batch_interleaving"], inst_cfg["fp"],
-                                           dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-                                           tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
-                                           dp_sum_total_len=sum_total_len,
-                                            enable_block_copy=inst_cfg["enable_block_copy"],
-                                            inputs_root=run_paths.inputs_root,
-                                            kv_offload_cpu=inst_cfg["enable_kv_offloading"])
-                            generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
-                                           inst_id, inst2npu_mapping[inst_id],
-                                           inst_cfg["enable_local_offloading"],
-                                           workload_name=dp_workload_name,
-                                           inputs_root=run_paths.inputs_root,
-                                           cleanup_trace=args.cleanup_inputs)
-                            if inst_id != instance_id:
-                                dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
-                                                                        workload_name=dp_workload_name,
-                                                                        inputs_root=run_paths.inputs_root)
-
-                        dp_pending[dg].clear()
-                        workload = get_workload(new_req, instance["hardware"], instance_id,
-                                                workload_name=dp_workload_name,
-                                                inputs_root=run_paths.inputs_root)
-                        controller.write_flush(p, workload)
+                        submit_dp_wave(dg, instance_id)
+                        responded = True
                     else:
                         # Waiting for other DP members — send pass
-                        controller.write_flush(p, "pass")
+                        workload_transport.pass_system()
                         responded = True
+                        if not bootstrap_systems_remaining:
+                            for peer_instance_id in dp_groups[dg]:
+                                if (peer_instance_id not in dp_pending[dg] and
+                                        not schedulers[peer_instance_id].inflight and
+                                        not any(
+                                            system_id in dp_active_systems[dg]
+                                            for system_id in range(
+                                                inst2npu_mapping[peer_instance_id],
+                                                inst2npu_mapping[peer_instance_id] +
+                                                instances[peer_instance_id]["num_npus"])
+                                        ) and
+                                        peer_instance_id not in done_instance):
+                                    queue_ready_system(
+                                        inst2npu_mapping[peer_instance_id])
                 else:
                     # Independent instance: generate trace immediately
                     inst_cfg = instance_runtime_configs[instance_id]
-                    generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
+                    prepared_execution = args.workload_transport == "ipc"
+                    direct_ipc = (
+                        prepared_execution and
+                        args.ipc_execution == "direct"
+                    )
+                    generated_trace = generate_trace(
+                                   new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
                                    instance["local_ep"], instance["ep_total"],
                                    instance["pd_type"],
                                    node_id, instance_id,
@@ -946,20 +1339,150 @@ def main():
                                     tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                     enable_block_copy=inst_cfg["enable_block_copy"],
                                     inputs_root=run_paths.inputs_root,
-                                    kv_offload_cpu=inst_cfg["enable_kv_offloading"])
-                    generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
-                                   instance_id, inst2npu_mapping[instance_id],
-                                   inst_cfg["enable_local_offloading"],
-                                   inputs_root=run_paths.inputs_root,
-                                   cleanup_trace=args.cleanup_inputs)
-                    workload = get_workload(new_req, instance["hardware"], instance_id,
-                                            inputs_root=run_paths.inputs_root)
-                    controller.write_flush(p, workload)
+                                    kv_offload_cpu=inst_cfg["enable_kv_offloading"],
+                                    host_timing=host_timing,
+                                    materialize=not direct_ipc,
+                                    render_text=not direct_ipc)
+
+                    trace_structure = None
+                    template_cache_key = None
+                    if args.workload_transport == "ipc":
+                        try:
+                            trace_structure = generated_trace.runtime_trace
+                            if trace_structure is None:
+                                with host_timing.measure("runtime_trace_parsing"):
+                                    trace_structure = RuntimeTraceSnapshot.parse(
+                                        generated_trace.ensure_text())
+                            template_cache_key = (
+                                instance_id, trace_structure.structure_key)
+                        except ValueError as error:
+                            logger.warning(
+                                "Runtime trace cannot use a structural template "
+                                "for instance %d: %s", instance_id, error)
+                    registered_template = get_compute_template(
+                        template_cache_key)
+                    if template_cache_key is not None:
+                        cache_result = (
+                            "hits" if registered_template is not None
+                            else "misses")
+                        host_timing.increment(
+                            f"template_cache_{cache_result}")
+                        host_timing.increment(
+                            f"template_cache_{cache_result}_"
+                            f"{trace_structure.template_class}")
+                    direct_trace_patch = (
+                        direct_ipc and
+                        registered_template is not None and
+                        registered_template[1].supports_trace_patch
+                    )
+
+                    patch = None
+                    if direct_trace_patch:
+                        template_id, template = registered_template
+                        try:
+                            with host_timing.measure("batch_patch_generation"):
+                                patch = template.build_patch_from_snapshot(
+                                    template_id, new_req.batch_id,
+                                    generated_trace.runtime_trace,
+                                    host_timing=host_timing)
+                            host_timing.increment("direct_trace_patches")
+                            host_timing.increment("trace_files_skipped")
+                            host_timing.increment("chakra_graphs_skipped")
+                        except ValueError as error:
+                            logger.warning(
+                                "Direct trace patch fallback for instance %d: %s",
+                                instance_id, error)
+                            host_timing.increment("direct_trace_patch_fallbacks")
+                            generated_trace = materialize_generated_trace(
+                                generated_trace)
+
+                    if patch is None:
+                        generated_trace = materialize_generated_trace(
+                            generated_trace)
+                        generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
+                                       instance_id, inst2npu_mapping[instance_id],
+                                       inst_cfg["enable_local_offloading"],
+                                       inputs_root=run_paths.inputs_root,
+                                       cleanup_trace=args.cleanup_inputs,
+                                       converter_mode=args.chakra_converter,
+                                       host_timing=host_timing)
+                        workload = get_workload(new_req, instance["hardware"], instance_id,
+                                                inputs_root=run_paths.inputs_root)
+                        if args.workload_transport == "ipc":
+                            first_system = inst2npu_mapping[instance_id]
+                            system_ids = list(range(
+                                first_system,
+                                first_system + instance["num_npus"],
+                            ))
+                            if instance["pd_type"] == "prefill":
+                                system_ids.extend(range(
+                                    first_system + instance["num_npus"],
+                                    first_system + 2 * instance["num_npus"],
+                                ))
+                            graphs = _read_chakra_graph_bundle(
+                                workload, system_ids)
+                            if registered_template is None:
+                                structure_suffix = (
+                                    trace_structure.structure_key
+                                    if trace_structure is not None
+                                    else f"batch-{new_req.batch_id}"
+                                )
+                                template = ChakraTemplateBundle(
+                                    f"instance-{instance_id}-{structure_suffix}", graphs,
+                                    runtime_trace=generated_trace.runtime_trace,
+                                    host_timing=host_timing)
+                                template_id = registered_template_ids.get(
+                                    template_cache_key)
+                                if template_id is None:
+                                    template_id = workload_transport.register_template(
+                                        template.template_key,
+                                        graphs,
+                                        bindings=template.bindings,
+                                    )
+                                    registered_template_ids[
+                                        template_cache_key] = template_id
+                                    record_compute_template_rss()
+                                    host_timing.increment(
+                                        f"template_registrations_"
+                                        f"{trace_structure.template_class}")
+                                else:
+                                    host_timing.increment(
+                                        "template_cache_rehydrations")
+                                    host_timing.increment(
+                                        f"template_cache_rehydrations_"
+                                        f"{trace_structure.template_class}")
+                                registered_template = (template_id, template)
+                                if template_cache_key is not None:
+                                    cache_compute_template(
+                                        template_cache_key,
+                                        registered_template)
+                            template_id, template = registered_template
+                            with host_timing.measure("batch_patch_generation"):
+                                patch = template.build_patch(
+                                    template_id, new_req.batch_id, graphs)
+
+                    if args.workload_transport == "ipc":
+                        workload_transport.prepare_batch(
+                            instance_id, patch, execute=prepared_execution)
+                        if prepared_execution:
+                            direct_submission_started = True
+                    if not prepared_execution:
+                        workload_transport.run_batch(workload)
+                        end_system = instance_end_system(instance_id)
+                        for submitted_system in range(
+                                inst2npu_mapping[instance_id] + 1,
+                                end_system + 1):
+                            if submitted_system not in new_req.fired:
+                                new_req.fired.append(submitted_system)
             elif new_req is not None:
                 # Non-first NPU: pick up existing batch workload
                 workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id,
                                         inputs_root=run_paths.inputs_root)
-                controller.write_flush(p, workload)
+                prepared_execution = args.workload_transport == "ipc"
+                if prepared_execution:
+                    workload_transport.pass_system()
+                else:
+                    workload_transport.run_batch(workload)
 
         # check time to store throughput (only print on start NPU to avoid transient states)
         if current > last_log + INTERVAL and sys == inst2npu_mapping[instance_id]:
@@ -1100,22 +1623,49 @@ def main():
                 all_dp_empty = all(
                     schedulers[inst_id].is_request_empty() and len(schedulers[inst_id].inflight) == 0
                     for inst_id in dp_groups[dg]
-                )
+                ) and not dp_active_systems[dg]
                 if not all_dp_empty:
                     # Other DP members still have work — keep this instance alive for dummy waves
                     if not responded:
-                        controller.write_flush(p, "pass")
+                        workload_transport.pass_system()
                     flush.stdout.flush()
                     continue
+                if not bootstrap_systems_remaining:
+                    for peer_instance_id in dp_groups[dg]:
+                        if peer_instance_id in done_instance:
+                            continue
+                        peer_start = inst2npu_mapping[peer_instance_id]
+                        peer_end = (
+                            peer_start +
+                            instances[peer_instance_id]["num_npus"] - 1)
+                        for peer_system in {peer_start, peer_end}:
+                            if (peer_system != sys and
+                                    peer_system not in
+                                    done_inst_npus[peer_instance_id]):
+                                queue_ready_system(peer_system)
 
             if sys not in done_inst_npus[instance_id]:
                 done_inst_npus[instance_id].append(sys)
-            if len(done_inst_npus[instance_id]) == (1 if instances[instance_id]["num_npus"] == 1 else 2):
+            required_boundary_reports = (
+                1 if instances[instance_id]["num_npus"] == 1 else 2)
+            if (len(done_inst_npus[instance_id]) <
+                    required_boundary_reports and
+                    sys == inst2npu_mapping[instance_id]):
+                # In TP, the end rank can finish just before the controller
+                # rank makes the batch terminal. Give that already-reported
+                # boundary one logical wake-up so shutdown can account for
+                # both sides without waiting for a duplicate C++ report.
+                queue_ready_system(instance_end_system(instance_id))
+            if (len(done_inst_npus[instance_id]) ==
+                    required_boundary_reports):
                 done_instance.append(instance_id)
 
             # check if all prefill instances are done
             if len(done_instance) == len(prefill_instance):
                 is_prefill_done = True
+                for decode_id in decode_instance:
+                    if decode_id not in done_instance:
+                        queue_ready_system(inst2npu_mapping[decode_id])
 
             # check if all instances are done
             if len(done_instance) == num_instances:
@@ -1128,26 +1678,46 @@ def main():
 
                 print_rule()
                 print_markup("[sim.heading]▶ Exiting simulation...[/]\n")
-                controller.write_flush(p, "exit")
+                workload_transport.close()
                 break
-            controller.write_flush(p, "done") # make done instances to sleep
+            workload_transport.sleep_system() # make done instances to sleep
         elif new_req == None and not responded:
             # If all instances are idle but deferred sessions have pending
             # requests with future arrival times (tool calls still running),
             # advance current time so the next iteration can pick them up.
             next_event = _next_idle_event(router, schedulers)
-            if next_event is not None and next_event > current:
+            globally_idle = (
+                all(not scheduler.inflight for scheduler in schedulers) and
+                all(not any(request.arrival <= current
+                            for request in scheduler.request)
+                    for scheduler in schedulers)
+            )
+            if (globally_idle and next_event is not None and
+                    next_event > current):
                 current = next_event
+                router.observe_concurrency(current)
                 for scheduler in schedulers:
                     scheduler.expire_session_kv(current)
-            controller.write_flush(p, "pass")
+                workload_transport.advance_time(current)
+                queue_ready_system(sys)
+            else:
+                workload_transport.pass_system()
         
         # flush
         flush.stdout.flush()
+        if (direct_submission_started and not completion_driven and
+                not bootstrap_systems_remaining):
+            controller.start_drain(p)
+            completion_driven = True
 
     # calculate simulation time
     end_time = time()
     total_time = end_time - start_time
+    host_timing.record("simulation_loop", total_time)
+    host_timing.record_rss_checkpoint(
+        "simulation_loop_complete", backend_pid=p.pid,
+        metadata={"terminal_sessions": router.terminal_session_count},
+    )
     hours, remainder = divmod(total_time, 3600)
     minutes, seconds = divmod(remainder, 60)
 
@@ -1245,7 +1815,34 @@ def main():
                     kv_offload_output, is_append=i != 0)
 
     if args.cleanup_inputs:
-        _cleanup_inputs_root(run_paths, logger)
+        with host_timing.measure("input_cleanup"):
+            _cleanup_inputs_root(run_paths, logger)
+
+    if args.host_timing_output is not None:
+        host_timing.record("frontend_elapsed", perf_counter() - process_start)
+        conversion_count = host_timing.sample_count("chakra_conversion")
+        host_timing.increment("chakra_conversions", conversion_count)
+        host_timing.increment(
+            "converter_process_launches",
+            conversion_count if args.chakra_converter == "subprocess" else 0,
+        )
+        host_timing.write_json(
+            args.host_timing_output,
+            metadata={
+                "run_id": args.run_id,
+                "network_backend": network_backend,
+                "chakra_converter": args.chakra_converter,
+                "workload_transport": args.workload_transport,
+                "ipc_execution": args.ipc_execution,
+                "total_clocks_ns": current,
+                "simulated_seconds": total_latency,
+                "completed_requests": req_cnt,
+                "input_tokens": total_prompt,
+                "generated_tokens": total_gen,
+                "workload_metrics": router.concurrency_summary(current),
+            },
+        )
+        print(f"Saving host timing summary to: {args.host_timing_output}")
     
 
 if __name__ == "__main__": 

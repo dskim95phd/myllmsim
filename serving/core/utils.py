@@ -1,6 +1,7 @@
 import os
 from time import time
 import json
+from functools import lru_cache
 
 from .run_paths import input_path
 
@@ -58,7 +59,15 @@ def formatter(layername, comp_time, input_loc, input_size, weight_loc, weight_si
     )
 
 
+@lru_cache(maxsize=None)
 def get_config(model_name):
+    """Load a model configuration once per serving process.
+
+    Model configurations are immutable simulation inputs. Returning the
+    cached object avoids reopening and reparsing the same JSON file from hot
+    layer-size calculation paths. Callers must treat the returned mapping as
+    read-only.
+    """
     base_dir = os.path.dirname(os.path.abspath(__file__))
     serving_dir = os.path.dirname(base_dir)
     repo_root = os.path.dirname(serving_dir)
