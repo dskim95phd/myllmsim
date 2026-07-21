@@ -71,6 +71,7 @@ message RunBatch {
   uint32 instance_id = 2;
   BatchPatch patch = 3;
   bool execute = 4;
+  uint32 controller_system_id = 5;
 }
 
 message BatchAccepted {
@@ -90,6 +91,7 @@ message RunWave {
   uint64 request_id = 1;
   uint64 wave_id = 2;
   repeated WaveRun runs = 3;
+  uint32 controller_system_id = 4;
 }
 
 message BatchDone {
@@ -103,4 +105,16 @@ message BatchDone {
 message SystemCommand {
   uint64 request_id = 1;
   uint32 system_id = 2;
+}
+
+message AdvanceTime {
+  uint64 request_id = 1;
+  uint32 system_id = 2;
+  uint64 current_time_ns = 3;
+}
+
+message FileWorkload {
+  uint64 request_id = 1;
+  uint32 system_id = 2;
+  string path = 3;
 }

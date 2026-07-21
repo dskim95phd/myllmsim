@@ -2,7 +2,6 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 import socket
-import struct
 from time import monotonic, sleep
 
 from serving.proto import llmservingsim_workload_pb2 as workload_pb2
@@ -110,9 +109,19 @@ class IpcFileWorkloadTransport(WorkloadTransport):
         self.host_timing = host_timing
         self.connection = connection or self._connect(connect_timeout)
         self.closed = False
+        self.system_id = None
         self._request_ids = count(1)
         self._completion_queue = deque()
         self._hello()
+
+    def set_system(self, system_id):
+        self.system_id = int(system_id)
+
+    def _require_system(self):
+        if self.system_id is None:
+            raise RuntimeError(
+                "IPC workload transport has no selected target system.")
+        return self.system_id
 
     def _connect(self, timeout):
         deadline = monotonic() + timeout
@@ -226,6 +235,10 @@ class IpcFileWorkloadTransport(WorkloadTransport):
                         f"{message_type.name}.")
         if self.host_timing is not None:
             self.host_timing.increment("batch_done_events")
+            self.host_timing.update_digest(
+                "batch_done_sequence",
+                completion.SerializeToString(deterministic=True),
+            )
         return completion
 
     def register_template(self, template_key, graphs, bindings=()):
@@ -281,12 +294,13 @@ class IpcFileWorkloadTransport(WorkloadTransport):
                 "validated_iteration_states", len(summaries))
         return response.template_id
 
-    @staticmethod
-    def _path_payload(workload):
-        return str(workload).encode("utf-8")
-
     def run_batch(self, workload):
-        self._send(MessageType.FILE_WORKLOAD, self._path_payload(workload))
+        request = workload_pb2.FileWorkload(
+            request_id=next(self._request_ids),
+            system_id=self._require_system(),
+            path=str(workload),
+        )
+        self._send(MessageType.FILE_WORKLOAD, request.SerializeToString())
         if self.host_timing is not None:
             self.host_timing.increment("run_batch_submissions")
 
@@ -295,6 +309,7 @@ class IpcFileWorkloadTransport(WorkloadTransport):
             request_id=next(self._request_ids),
             instance_id=instance_id,
             execute=execute,
+            controller_system_id=self._require_system(),
         )
         request.patch.CopyFrom(patch)
         if self.host_timing is not None:
@@ -338,7 +353,12 @@ class IpcFileWorkloadTransport(WorkloadTransport):
                 "batch_patch_values_sent", expected_value_count)
 
     def run_wave(self, workload, system_ids=None):
-        self._send(MessageType.FILE_WORKLOAD, self._path_payload(workload))
+        request = workload_pb2.FileWorkload(
+            request_id=next(self._request_ids),
+            system_id=self._require_system(),
+            path=str(workload),
+        )
+        self._send(MessageType.FILE_WORKLOAD, request.SerializeToString())
         if self.host_timing is not None:
             self.host_timing.increment("run_wave_submissions")
 
@@ -346,6 +366,7 @@ class IpcFileWorkloadTransport(WorkloadTransport):
         request = workload_pb2.RunWave(
             request_id=next(self._request_ids),
             wave_id=wave_id,
+            controller_system_id=self._require_system(),
         )
         expected_system_count = 0
         expected_value_count = 0
@@ -396,20 +417,30 @@ class IpcFileWorkloadTransport(WorkloadTransport):
                 "wave_patch_values_sent", expected_value_count)
 
     def pass_system(self):
-        self._send(MessageType.PASS)
+        request = workload_pb2.SystemCommand(
+            request_id=next(self._request_ids),
+            system_id=self._require_system(),
+        )
+        self._send(MessageType.PASS, request.SerializeToString())
         if self.host_timing is not None:
             self.host_timing.increment("pass_submissions")
 
     def advance_time(self, current_time_ns):
-        self._send(
-            MessageType.ADVANCE_TIME,
-            struct.pack("!Q", int(current_time_ns)),
+        request = workload_pb2.AdvanceTime(
+            request_id=next(self._request_ids),
+            system_id=self._require_system(),
+            current_time_ns=int(current_time_ns),
         )
+        self._send(MessageType.ADVANCE_TIME, request.SerializeToString())
         if self.host_timing is not None:
             self.host_timing.increment("time_advance_submissions")
 
     def sleep_system(self):
-        self._send(MessageType.SLEEP)
+        request = workload_pb2.SystemCommand(
+            request_id=next(self._request_ids),
+            system_id=self._require_system(),
+        )
+        self._send(MessageType.SLEEP, request.SerializeToString())
         if self.host_timing is not None:
             self.host_timing.increment("sleep_submissions")
 
@@ -417,7 +448,11 @@ class IpcFileWorkloadTransport(WorkloadTransport):
         if self.closed:
             return
         try:
-            self._send(MessageType.EXIT)
+            request = workload_pb2.SystemCommand(
+                request_id=next(self._request_ids),
+                system_id=self._require_system(),
+            )
+            self._send(MessageType.EXIT, request.SerializeToString())
             if self.host_timing is not None:
                 self.host_timing.increment("exit_submissions")
         finally:

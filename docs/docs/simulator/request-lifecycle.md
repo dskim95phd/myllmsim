@@ -238,6 +238,11 @@ Waiting <sys=0> id=42 cycle=178654321
 
 `controller.read_wait` blocks until that line appears. Direct IPC instead
 waits for a structured `BATCH_DONE` message, avoiding repeated `PASS` polling.
+Protocol v2 includes the selected controller system in every workload and
+control command. At a simulated timestamp, ASTRA-Sim reports the complete
+deterministically ordered completion frontier before applying any command
+received from the host. Consequently, PD routing cannot depend on socket
+arrival timing when prefill and decode systems finish together.
 
 For **DP groups**, use IPC oracle or direct execution. The legacy file control
 path is rejected because it cannot atomically install every collective

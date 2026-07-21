@@ -94,6 +94,16 @@ SCENARIOS = {
         "dataset": "generated:moderate",
         "num_reqs": 10,
     },
+    "pd50": {
+        "cluster": "configs/cluster/single_node_pd_instance.json",
+        "dataset": "generated:moderate",
+        "num_reqs": 50,
+    },
+    "pd100-burst": {
+        "cluster": "configs/cluster/single_node_pd_instance.json",
+        "dataset": "generated:burst",
+        "num_reqs": 100,
+    },
     "session_kv1": {
         "cluster": (
             "configs/cluster/"
@@ -597,6 +607,14 @@ def aggregate(records, scenarios, modes):
                 )
                 for record in selected
             })
+            sequence_digests = sorted({
+                tuple(sorted(
+                    (name, value["sha256"])
+                    for name, value in
+                    record.get("sequence_digests", {}).items()
+                ))
+                for record in selected
+            })
             scenario_summary["modes"][mode] = {
                 "runs": len(values),
                 "median_wall_seconds": statistics.median(values),
@@ -606,15 +624,9 @@ def aggregate(records, scenarios, modes):
                 "min_wall_seconds": min(values),
                 "max_wall_seconds": max(values),
                 "fingerprints": fingerprints,
-                "internally_deterministic": len(fingerprints) == 1,
-                "sequence_digests": sorted({
-                    tuple(sorted(
-                        (name, value["sha256"])
-                        for name, value in
-                        record.get("sequence_digests", {}).items()
-                    ))
-                    for record in selected
-                }),
+                "internally_deterministic": (
+                    len(fingerprints) == 1 and len(sequence_digests) == 1),
+                "sequence_digests": sequence_digests,
             }
             simulation_loop_values = [
                 record["reported_simulation_loop_seconds"]
@@ -746,10 +758,23 @@ def aggregate(records, scenarios, modes):
             reference = scenario_summary["modes"][reference_mode]
             for mode in modes[reference_index + 1:]:
                 candidate = scenario_summary["modes"][mode]
+                reference_sequences = dict(
+                    reference["sequence_digests"][0]
+                    if len(reference["sequence_digests"]) == 1 else ())
+                candidate_sequences = dict(
+                    candidate["sequence_digests"][0]
+                    if len(candidate["sequence_digests"]) == 1 else ())
+                common_sequences = (
+                    reference_sequences.keys() & candidate_sequences.keys())
+                sequence_match = all(
+                    reference_sequences[name] == candidate_sequences[name]
+                    for name in common_sequences
+                )
                 exact = (
                     reference["internally_deterministic"] and
                     candidate["internally_deterministic"] and
-                    reference["fingerprints"] == candidate["fingerprints"]
+                    reference["fingerprints"] == candidate["fingerprints"] and
+                    sequence_match
                 )
                 scenario_summary["comparisons"][
                     f"{reference_mode}_vs_{mode}"] = {

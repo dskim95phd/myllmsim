@@ -86,6 +86,17 @@ patched values, and issued/completed state backed by the immutable template.
 `RUN_BATCH` and `RUN_WAVE` use the same template and patch representation. The
 difference is when execution may begin.
 
+Workload IPC protocol v2 carries a controller system ID on every execution and
+control command. The analytical backend therefore applies a command to the
+system selected by the frontend instead of inferring the target from whichever
+system happens to be waiting when the socket frame arrives.
+
+At each simulated timestamp, the backend also freezes the complete set of
+finished boundary systems and emits their `BATCH_DONE` messages in stable
+end-system/start-system order before applying any newly received command. This
+completion frontier prevents fast direct submissions from changing the set or
+order of equal-time PD completions.
+
 ### Independent batch
 
 `RUN_BATCH` submits one logical instance. TP, PP, and local EP ranks belonging
@@ -130,7 +141,7 @@ Status date: **2026-07-22**.
 | Compiled profile cache | Implemented | Fingerprinted, versioned, compressed, and invalidated by source changes |
 | Template registry and runtime-state split | Implemented | Repeated direct execution uses immutable templates and fresh state |
 | `RUN_BATCH` | Implemented | Dense, TP, PP, PD, local-EP, PIM, and migration regressions completed |
-| `BATCH_DONE` | Implemented | Direct execution no longer sends repeated `PASS` polling traffic |
+| `BATCH_DONE` | Implemented and deterministic | Protocol v2 targets every command; equal-time completions are frozen before host commands are applied; completion sequence digests are part of the benchmark gate |
 | `RUN_WAVE` | Implemented and rejection-tested | Ten-session DP+EP oracle/direct runs are exact; two repeated pairs have identical 60-wave patch digests; a real-socket C++ test proves atomic rejection and connection recovery |
 | Bounded template cache | Implemented | Capacity validation and LRU eviction tests added; capacity-2 PIM run exercised rehydration |
 | Event-driven analytical loop | Implemented and rebuilt | Both analytical backends block for IPC instead of deriving virtual time from host latency; tool gaps use `ADVANCE_TIME` |
@@ -140,10 +151,11 @@ Status date: **2026-07-22**.
 | Compact patch encoding | Implemented | Slot/value pairs use packed protobuf integers while the legacy representation remains readable |
 | Default transport decision | Analytical defaults to IPC/direct | Dense-100 and agentic-50 repetition gates, current-oracle correctness, and 100/300-session RSS gates are closed; ns-3 remains file-only |
 
-The Python test suite currently contains 22 graph-pipeline tests. It covers
+The Python test suite currently contains 24 graph-pipeline tests. It covers
 framing, template/patch behavior, compiled-cache invalidation, LRU eviction,
-host metrics, agentic concurrency, and related helpers. End-to-end equivalence
-remains the authoritative gate.
+host metrics, agentic concurrency, completion-sequence determinism, and related
+helpers. The full Python suite contains 96 tests. End-to-end equivalence remains
+the authoritative gate.
 
 ## Results recorded so far
 
@@ -157,6 +169,8 @@ five-run satisfy the final headline repetition rule.
 | `cdcc8aa` / direct, dense 100 requests | 5 per mode | 14.72x median (241.876 s → 16.432 s) | Exact request CSV and final clock in all runs |
 | `cdcc8aa` / direct, agentic 10 sessions | 5 per mode | 9.03x median speedup | Baseline virtual time differs because `ADVANCE_TIME` fixes host-latency leakage; not correctness-qualified against the old commit |
 | current oracle / direct, PD 10 sessions | 5 per mode | 1.99x median (4.013 s → 2.015 s) | Exact CSV and clock in all runs |
+| protocol-v2 oracle / direct, PD 50 moderate sessions | 5 per mode | 4.92x median (14.581 s → 2.962 s) | Exact CSV, clock, patch digest, and 450-event completion digest in all runs |
+| protocol-v2 oracle / direct, PD 100 burst sessions | 3 per mode | 7.12x median (28.096 s → 3.947 s) | Exact CSV, clock, patch digest, and 900-event completion digest in all runs |
 | current oracle / direct, local-EP 533 batches | 1 per mode | 4.70x | Exact CSV and clock |
 | current oracle / direct, DP+EP 10 sessions | 5 per mode | 2.72x median (6.667 s → 2.450 s) | Exact CSV, clock, and wave digest in all runs |
 | current oracle / direct, session KV 10 sessions | 5 per mode | 2.12x median (3.709 s → 1.753 s) | Exact request and KV sidecar hashes in all runs |

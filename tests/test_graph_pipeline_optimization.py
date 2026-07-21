@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from scripts.benchmark_chakra_pipeline import aggregate
 from serving.proto import llmservingsim_workload_pb2 as workload_pb2
 from serving.core.chakra_template import (
     BoundedTemplateCache,
@@ -481,15 +482,15 @@ class WorkloadProtocolTest(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "magic"):
             decode_header(b"BAD!" + valid[4:HEADER_SIZE])
 
-        bad_version = struct.pack("!4sHHQ", b"LSIM", 2, 1, 0)
+        bad_version = struct.pack("!4sHHQ", b"LSIM", 3, 1, 0)
         with self.assertRaisesRegex(ProtocolError, "version"):
             decode_header(bad_version)
 
-        bad_type = struct.pack("!4sHHQ", b"LSIM", 1, 99, 0)
+        bad_type = struct.pack("!4sHHQ", b"LSIM", 2, 99, 0)
         with self.assertRaisesRegex(ProtocolError, "message type"):
             decode_header(bad_type)
 
-        too_large = struct.pack("!4sHHQ", b"LSIM", 1, 1, 11)
+        too_large = struct.pack("!4sHHQ", b"LSIM", 2, 1, 11)
         with self.assertRaisesRegex(ProtocolError, "exceeds limit"):
             decode_header(too_large, max_payload_bytes=10)
 
@@ -605,6 +606,8 @@ class FileWorkloadTransportTest(unittest.TestCase):
             recorder = HostTimingRecorder()
             transport = IpcFileWorkloadTransport(
                 "unused", host_timing=recorder, connection=client)
+            with self.assertRaisesRegex(RuntimeError, "target system"):
+                transport.pass_system()
             template_id = transport.register_template(
                 "dense-test",
                 {1: b"graph-one", 0: b"graph-zero"},
@@ -619,6 +622,7 @@ class FileWorkloadTransportTest(unittest.TestCase):
             patch = workload_pb2.BatchPatch(batch_id=11, template_id=template_id)
             patch.systems.add(system_id=0).values.add(slot_id=3, value=91)
             patch.systems.add(system_id=1)
+            transport.set_system(3)
             transport.prepare_batch(4, patch)
             transport.prepare_wave(23, [(4, patch)])
             transport.run_batch("batch.et")
@@ -642,26 +646,36 @@ class FileWorkloadTransportTest(unittest.TestCase):
              for graph in registration.graphs],
             [(0, b"graph-zero"), (1, b"graph-one")],
         )
-        self.assertEqual(
-            received[4:],
-            [
-                (MessageType.FILE_WORKLOAD, b"batch.et"),
-                (MessageType.FILE_WORKLOAD, b"wave.et"),
-                (MessageType.ADVANCE_TIME, struct.pack("!Q", 123456)),
-                (MessageType.PASS, b""),
-                (MessageType.SLEEP, b""),
-                (MessageType.EXIT, b""),
-            ],
-        )
         self.assertEqual(received[2][0], MessageType.RUN_BATCH)
         run_batch = workload_pb2.RunBatch.FromString(received[2][1])
         self.assertEqual(run_batch.instance_id, 4)
+        self.assertEqual(run_batch.controller_system_id, 3)
         self.assertFalse(run_batch.execute)
         self.assertEqual(run_batch.patch.batch_id, 11)
         self.assertEqual(received[3][0], MessageType.RUN_WAVE)
         run_wave = workload_pb2.RunWave.FromString(received[3][1])
         self.assertEqual(run_wave.wave_id, 23)
+        self.assertEqual(run_wave.controller_system_id, 3)
         self.assertEqual(len(run_wave.runs), 1)
+        batch_file = workload_pb2.FileWorkload.FromString(received[4][1])
+        wave_file = workload_pb2.FileWorkload.FromString(received[5][1])
+        advance = workload_pb2.AdvanceTime.FromString(received[6][1])
+        controls = [
+            workload_pb2.SystemCommand.FromString(payload)
+            for _, payload in received[7:10]
+        ]
+        self.assertEqual(received[4][0], MessageType.FILE_WORKLOAD)
+        self.assertEqual((batch_file.system_id, batch_file.path), (3, "batch.et"))
+        self.assertEqual(received[5][0], MessageType.FILE_WORKLOAD)
+        self.assertEqual((wave_file.system_id, wave_file.path), (3, "wave.et"))
+        self.assertEqual(received[6][0], MessageType.ADVANCE_TIME)
+        self.assertEqual(
+            (advance.system_id, advance.current_time_ns), (3, 123456))
+        self.assertEqual(
+            [message_type for message_type, _ in received[7:10]],
+            [MessageType.PASS, MessageType.SLEEP, MessageType.EXIT],
+        )
+        self.assertEqual([control.system_id for control in controls], [3, 3, 3])
         counters = recorder.summary()["counters"]
         self.assertEqual(counters["ipc_messages_sent"], 10)
         self.assertEqual(counters["ipc_messages_received"], 4)
@@ -674,6 +688,57 @@ class FileWorkloadTransportTest(unittest.TestCase):
         self.assertEqual(counters["run_wave_patch_submissions"], 1)
         self.assertEqual(counters["wave_participants"], 1)
         self.assertEqual(counters["time_advance_submissions"], 1)
+
+
+class BenchmarkDeterminismTest(unittest.TestCase):
+    @staticmethod
+    def _record(mode, digest):
+        return {
+            "scenario": "pd-stress",
+            "mode": mode,
+            "warmup": False,
+            "wall_seconds": 1.0,
+            "correctness": {"combined_sha256": "result", "rows": 1},
+            "total_clocks_ns": 10,
+            "reported_simulation_loop_seconds": None,
+            "resource_usage": None,
+            "transport_counters": {},
+            "stage_timing": {},
+            "rss_checkpoints": [],
+            "sequence_digests": {
+                "batch_done_sequence": {"sha256": digest},
+            },
+            "workload_metrics": {},
+            "stage_reconciliation": {},
+        }
+
+    def test_completion_sequence_is_part_of_determinism_gate(self):
+        records = [
+            self._record("oracle", "stable"),
+            self._record("oracle", "stable"),
+            self._record("direct", "stable"),
+            self._record("direct", "racy"),
+        ]
+
+        summary = aggregate(
+            records, ["pd-stress"], ["oracle", "direct"])["scenarios"][
+                "pd-stress"]
+
+        self.assertFalse(summary["modes"]["direct"]["internally_deterministic"])
+        self.assertFalse(
+            summary["comparisons"]["oracle_vs_direct"]["correctness_exact"])
+
+    def test_common_completion_sequences_must_match(self):
+        records = [
+            self._record("oracle", "oracle-order"),
+            self._record("direct", "direct-order"),
+        ]
+
+        comparison = aggregate(
+            records, ["pd-stress"], ["oracle", "direct"])["scenarios"][
+                "pd-stress"]["comparisons"]["oracle_vs_direct"]
+
+        self.assertFalse(comparison["correctness_exact"])
 
 
 if __name__ == "__main__":
