@@ -4,10 +4,10 @@ title: Running CPU KV Offloading Experiments on a Server
 
 # Running CPU KV Offloading Experiments on a Server
 
-This runbook executes the staged CPU KV offloading experiment on a Linux
-server. Start with load calibration and review its results before launching
-the capacity screen. Do not launch the original 1,000-session, 135-run matrix
-as the first server job.
+The checked-in experiment runner generates every workload and derived cluster
+configuration, runs the staged matrix, validates direct IPC against transport
+oracle, and writes resumable records and summaries. Run it from the repository
+root inside the simulator container.
 
 ## 1. Server requirements
 
@@ -17,12 +17,23 @@ with:
 - Docker and permission to run containers;
 - at least 8 CPU cores, 16 GiB host RAM, and 30 GiB free disk space;
 - a persistent filesystem for the repository and `outputs/`;
-- `git`, `bash`, and `timeout` on the host.
+- `git` and `bash` on the host.
 
-More CPU cores help only when independent runs execute concurrently. Simulated
-NPU and CPU memory sizes do not allocate corresponding amounts of host memory.
+More CPU cores help when independent simulator cases run concurrently. The
+runner is serial by default so its wall-time measurements remain comparable.
+It pins the common OpenMP and BLAS thread counts to one per child, so
+`--workers N` means at most `N` independent Python + ASTRA-Sim process trees.
+Simulated NPU and CPU capacities do not allocate the same amount of host
+memory.
 
-## 2. Clone the exact branch and submodules
+An Intel Xeon 6767P has 64 physical cores and 128 threads. Start this
+experiment at `--workers 8`, observe host RAM, CPU use, and storage latency,
+then try 12 or 16. Do not start at 64: graph conversion, process startup,
+filesystem traffic, and shared memory bandwidth keep scaling from being
+linear. Keep the timing stage serial even on this CPU. See the
+[Intel Xeon 6767P specifications](https://www.intel.com/content/www/us/en/products/sku/241845/intel-xeon-6767p-processor-336m-cache-2-40-ghz/specifications.html).
+
+## 2. Clone and build
 
 ```bash
 git clone --recurse-submodules \
@@ -36,51 +47,31 @@ git status --short
 git submodule status --recursive
 ```
 
-The first column of every `git submodule status` line must be blank. A leading
-`-` means the submodule is not initialized, and `+` means it is checked out at
-a different commit.
+The required submodules must have a blank first status column. A leading `+`
+means a revision mismatch. The nested
+`astra-sim/extern/network_backend/ns-3` entry is the exception: it has
+`update = none`, so a leading `-` is expected and does not block this
+analytical experiment.
 
-Record the exact revisions before running:
-
-```bash
-mkdir -p outputs/cpu_kv_experiment/server
-git rev-parse HEAD \
-  > outputs/cpu_kv_experiment/server/root_commit.txt
-git submodule status --recursive \
-  > outputs/cpu_kv_experiment/server/submodule_commits.txt
-```
-
-## 3. Create and build the simulator container
-
-Launch the container from the repository root:
+Create the simulator container:
 
 ```bash
 ./scripts/docker-sim.sh
 ```
 
-The command opens a shell inside `servingsim_docker` with the repository
-mounted at `/app/LLMServingSim`. In that shell, build ASTRA-Sim and install the
-checked-out Chakra converter:
+Inside the container, build ASTRA-Sim and install the checked-out Chakra fork:
 
 ```bash
 cd /app/LLMServingSim
 ./scripts/compile.sh
 ```
 
-This step is mandatory. A previously built image may contain an older Chakra
-package that fails on migration-only traces. Rerun it whenever the ASTRA-Sim
-or Chakra submodule commit changes.
+Rerun `scripts/compile.sh` whenever the ASTRA-Sim, Chakra, or analytical-
+network submodule revision changes.
 
-For later logins, reattach without creating another container:
+## 3. Validate the checkout
 
-```bash
-docker start servingsim_docker
-docker exec -it servingsim_docker bash
-```
-
-## 4. Validate the environment
-
-Run these checks inside the container:
+Run inside the container:
 
 ```bash
 cd /app/LLMServingSim
@@ -88,255 +79,227 @@ cd /app/LLMServingSim
 python3 -m unittest \
   tests.test_session_kv_generator \
   tests.test_session_kv_retention \
-  tests.test_kv_offloading_foundation -q
+  tests.test_kv_offloading_foundation \
+  tests.test_cpu_kv_experiment_runner -q
 
-python3 -m workloads.generators session-kv --help >/dev/null
+python3 scripts/run_cpu_kv_experiment.py --help
 test -x \
   astra-sim/build/astra_analytical/build/AnalyticalAstra/bin/AnalyticalAstra
 ```
 
-The current expected unit-test result is 72 passing tests.
+## 4. Run the complete pilot
 
-## 5. Create a reproducible result directory
-
-Use a separate directory for each server batch:
+Choose one result directory and reuse it when resuming:
 
 ```bash
 cd /app/LLMServingSim
 
-export CPU_KV_RUN_ID="$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)"
-export CPU_KV_RUN_ROOT="outputs/cpu_kv_experiment/server/${CPU_KV_RUN_ID}"
-mkdir -p "${CPU_KV_RUN_ROOT}/workloads" "${CPU_KV_RUN_ROOT}/runs"
+RUN_ID="$(git rev-parse --short HEAD)_$(date +%Y%m%d_%H%M%S)"
+RUN_ROOT="outputs/cpu_kv_experiment/server/${RUN_ID}"
+mkdir -p "${RUN_ROOT}"
 
-git rev-parse HEAD > "${CPU_KV_RUN_ROOT}/root_commit.txt"
-git submodule status --recursive \
-  > "${CPU_KV_RUN_ROOT}/submodule_commits.txt"
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" \
+  pilot 2>&1 | tee "${RUN_ROOT}/launcher.log"
 ```
 
-Do not reuse a result directory. The generated workload and its summary must
-remain unchanged across the policies being compared.
+The pilot performs the following steps without manual config editing:
 
-## 6. Define a single-run helper
+1. paired 10-session Recompute and 16 GiB Session-offload timing runs;
+2. paired 20-session calibration runs at 0.5, 1.0, 1.5, and 2.0 sessions/s;
+3. low/high 50-session screens for Recompute, Active offload, Session offload
+   at 4/16/64/256 GiB, NPU-only retention at low load, and Capacity oracle;
+4. one high-load 16 GiB Session-offload transport-oracle run;
+5. exact comparison of direct/oracle request CSV, KV sidecar, simulated clock,
+   and completion-sequence digests.
 
-Paste this function into the container shell. It records the command, copied
-configuration, process log, wall time, and exit status. The six-hour timeout
-prevents an unattended stalled run from occupying the server indefinitely.
+Every case has a one-hour timeout by default. Change it with
+`--case-timeout-seconds`, placed before `pilot`. A timed-out or interrupted
+batch can be resumed using the exact same command. Completed cases are checked
+against their config, workload, and output schema before being skipped.
+
+### Split the pilot and use multiple cores
+
+The pilot can be stopped between stages and resumed from the same `RUN_ROOT`.
+Run the wall-time pair alone, then parallelize the independent calibration and
+screen cases:
 
 ```bash
-run_cpu_kv_case() {
-  local label="$1"
-  local config="$2"
-  local workload="$3"
-  local sessions="$4"
-  local run_dir="${CPU_KV_RUN_ROOT}/runs/${label}"
-  local start_epoch
-  local end_epoch
-  local status
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 1 \
+  pilot --stages timing \
+  2>&1 | tee "${RUN_ROOT}/pilot-timing.log"
 
-  mkdir -p "${run_dir}"
-  cp "${config}" "${run_dir}/cluster_config.json"
-  cp "${workload}.summary.json" "${run_dir}/workload.summary.json"
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 8 \
+  pilot --stages calibration \
+  2>&1 | tee "${RUN_ROOT}/pilot-calibration.log"
 
-  printf '%s\n' \
-    "python3 -m serving --cluster-config ${config} --dtype bfloat16 --block-size 16 --dataset ${workload} --output ${run_dir}/requests.csv --num-reqs ${sessions} --log-level WARNING --log-interval 10" \
-    > "${run_dir}/command.txt"
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 8 \
+  pilot --stages screen \
+  2>&1 | tee "${RUN_ROOT}/pilot-screen.log"
 
-  start_epoch="$(date +%s)"
-  set -o pipefail
-  timeout --signal=TERM --kill-after=30s 6h \
-    python3 -m serving \
-      --cluster-config "${config}" \
-      --dtype bfloat16 \
-      --block-size 16 \
-      --dataset "${workload}" \
-      --output "${run_dir}/requests.csv" \
-      --num-reqs "${sessions}" \
-      --log-level WARNING \
-      --log-interval 10 \
-    2>&1 | tee "${run_dir}/run.log"
-  status="${PIPESTATUS[0]}"
-  set +o pipefail
-  end_epoch="$(date +%s)"
-
-  printf '%s\n' "$((end_epoch - start_epoch))" \
-    > "${run_dir}/wall_seconds.txt"
-  printf '%s\n' "${status}" > "${run_dir}/exit_code.txt"
-  return "${status}"
-}
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 1 \
+  pilot --stages validation \
+  2>&1 | tee "${RUN_ROOT}/pilot-validation.log"
 ```
 
-Exit code `0`, a `requests.csv` file, and `All Request Has Been Exited` in the
-log together indicate a completed run. Exit code `124` indicates timeout.
+Later stages read the rates selected by calibration from `pilot.json`.
+Validation also reuses the screen's recorded session count, seed, and gap
+profile, so they do not need to be repeated. Keep 16 in
+`--screen-capacities`: the exact direct/oracle validation pair uses the 16 GiB
+Session-offload case.
 
-## 7. Gate 1: calibrate offered load
-
-Generate one 20-session workload for each arrival rate. Use seed 7 for this
-first calibration:
+## 5. Review the pilot
 
 ```bash
-for rate in 0.5 1.0 1.5 2.0; do
-  rate_label="${rate/./p}"
-  python3 -m workloads.generators session-kv \
-    --num-sessions 20 \
-    --session-rate "${rate}" \
-    --seed 7 \
-    --gap-profile mixed \
-    --output "${CPU_KV_RUN_ROOT}/workloads/rate_${rate_label}_seed7.jsonl"
-done
+cat "${RUN_ROOT}/pilot.json"
+column -s, -t < "${RUN_ROOT}/summary.csv" | less -S
 ```
 
-Run Recompute and 16 GiB Session offload against each identical workload:
+`pilot.json` records `lambda_sat`, low/high/overload rates, and the transport-
+oracle validation result. `summary.csv` contains operational status, wall and
+simulated time, request/session latency percentiles, session makespan,
+throughput, migrations, NPU/CPU hits, misses, recomputed tokens, and capacity
+drops.
+
+If `calibration_upper_bound_reached` is `true`, the highest tested rate also
+completed. Create a new run directory and extend the range before treating
+`lambda_sat` as a saturation estimate:
 
 ```bash
-for rate in 0.5 1.0 1.5 2.0; do
-  rate_label="${rate/./p}"
-  workload="${CPU_KV_RUN_ROOT}/workloads/rate_${rate_label}_seed7.jsonl"
-
-  run_cpu_kv_case \
-    "calibrate_rate_${rate_label}_recompute" \
-    configs/cluster/single_node_session_kv_experiment_recompute.json \
-    "${workload}" 20 || true
-
-  run_cpu_kv_case \
-    "calibrate_rate_${rate_label}_offload_16gb" \
-    configs/cluster/single_node_session_kv_experiment_offload_16gb.json \
-    "${workload}" 20 || true
-done
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "outputs/cpu_kv_experiment/server/${RUN_ID}_extended" \
+  pilot \
+  --calibration-rates 0.5,1,1.5,2,3,4
 ```
 
-Treat the largest Recompute rate that completes without a persistent
-no-progress interval as the provisional saturation rate. A known bad state is
-zero running requests, a growing waiting queue, and NPU memory remaining near
-100%. Do not use such a run as a stable-load result.
+Inspect any failed case under `runs/<case>/run.log`. Do not start confirmation
+until direct/oracle validation passes and the selected low and high rates are
+scientifically acceptable.
 
-Select low and high rates near `0.6 * lambda_sat` and
-`0.9 * lambda_sat`. Generate new 50-session workloads for those exact rates
-instead of reusing a workload generated at a different rate.
+## 6. Run the confirmation matrix
 
-## 8. Gate 2: screen CPU capacity
-
-Start with 4, 16, 64, and 256 GiB. Generate capacity-specific configs under
-the result directory so the tracked template remains unchanged:
+The default confirmation matrix uses the rates selected by the pilot, 1,000
+sessions, seeds 7/17/29/43/71, and CPU capacities
+4/8/16/32/64/128/256 GiB:
 
 ```bash
-for capacity in 4 16 64 256; do
-  output_config="${CPU_KV_RUN_ROOT}/offload_${capacity}gb.json"
-  python3 - "${capacity}" "${output_config}" <<'PY'
-import json
-import sys
-
-capacity = int(sys.argv[1])
-output_path = sys.argv[2]
-template = "configs/cluster/single_node_session_kv_experiment_offload_16gb.json"
-
-with open(template, encoding="utf-8") as input_file:
-    config = json.load(input_file)
-config["nodes"][0]["cpu_mem"]["mem_size"] = capacity
-with open(output_path, "w", encoding="utf-8") as output_file:
-    json.dump(config, output_file, indent=2)
-    output_file.write("\n")
-PY
-done
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 8 \
+  confirm 2>&1 | tee "${RUN_ROOT}/confirm.log"
 ```
 
-For each selected load, generate one 50-session workload and run Recompute
-once plus every capacity against that same file. Replace `LOW_RATE` and
-`HIGH_RATE` below with the calibrated numeric values:
+Each `(load, seed)` workload is generated once and reused by every policy and
+capacity. The matrix includes Recompute, Active offload, Session offload,
+Capacity oracle, and the low-load NPU-retention reference.
+
+To use a smaller confirmation before the full matrix:
 
 ```bash
-for load_spec in low:LOW_RATE high:HIGH_RATE; do
-  load_label="${load_spec%%:*}"
-  rate="${load_spec##*:}"
-  workload="${CPU_KV_RUN_ROOT}/workloads/${load_label}_seed7.jsonl"
-
-  python3 -m workloads.generators session-kv \
-    --num-sessions 50 \
-    --session-rate "${rate}" \
-    --seed 7 \
-    --gap-profile mixed \
-    --output "${workload}"
-
-  run_cpu_kv_case \
-    "screen_${load_label}_recompute" \
-    configs/cluster/single_node_session_kv_experiment_recompute.json \
-    "${workload}" 50 || true
-
-  for capacity in 4 16 64 256; do
-    run_cpu_kv_case \
-      "screen_${load_label}_offload_${capacity}gb" \
-      "${CPU_KV_RUN_ROOT}/offload_${capacity}gb.json" \
-      "${workload}" 50 || true
-  done
-done
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" \
+  confirm \
+  --sessions 200 \
+  --seeds 7 \
+  --capacities 4,16,64,256
 ```
 
-Review this screen before adding 8, 32, and 128 GiB or more seeds. Expand only
-around the observed capacity knee.
+The runner includes session count, seed, and capacity in confirmation case
+identities, so a smaller confirmation and the full matrix can share the pilot
+run root. Use a separate run root when changing the workload gap profile or
+calibration design.
 
-## 9. Run safely after disconnecting SSH
-
-For a long batch, save the commands above in a script such as
-`run_server_batch.sh` inside the result directory. Start it from the host with
-the existing container running:
+The confirmation matrix can also be divided by load without losing resume or
+summary behavior:
 
 ```bash
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 8 \
+  confirm --loads low
+
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 8 \
+  confirm --loads high
+
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" --workers 8 \
+  confirm --loads overload
+```
+
+For still smaller jobs, combine `--loads` with a subset of `--seeds` and
+`--capacities`. Rerunning later with the full lists skips the already validated
+cases. While tuning worker count, compare total elapsed time for the same small
+matrix at 8, 12, and 16 workers; per-case `wall_seconds` is intentionally not a
+clean performance measurement under contention.
+
+## 7. Run after disconnecting SSH
+
+From the host, start confirmation in the existing container:
+
+```bash
+RUN_ROOT="outputs/cpu_kv_experiment/server/REPLACE_WITH_RUN_ID"
+
 docker start servingsim_docker
-
-nohup docker exec servingsim_docker bash -lc \
-  'cd /app/LLMServingSim && bash outputs/cpu_kv_experiment/server/RUN_ID/run_server_batch.sh' \
-  > outputs/cpu_kv_experiment/server/RUN_ID/launcher.log 2>&1 &
-
-echo $! > outputs/cpu_kv_experiment/server/RUN_ID/launcher.pid
+docker exec -d -w /app/LLMServingSim servingsim_docker \
+  bash -lc "python3 scripts/run_cpu_kv_experiment.py \
+    --run-root '${RUN_ROOT}' confirm \
+    > '${RUN_ROOT}/confirm.log' 2>&1"
 ```
 
-Replace `RUN_ID` with the created directory name. Monitor it from the host:
+Monitor from the host:
 
 ```bash
-tail -f outputs/cpu_kv_experiment/server/RUN_ID/launcher.log
+tail -f "${RUN_ROOT}/confirm.log"
 docker stats servingsim_docker
-find outputs/cpu_kv_experiment/server/RUN_ID/runs \
-  -name exit_code.txt -print -exec cat {} \;
+find "${RUN_ROOT}/runs" -name record.json | wc -l
 ```
 
-Keep the calibration batch serial so wall-time measurements remain useful.
-After calibration, at most two independent screening runs should execute in
-parallel initially. Increase concurrency only if CPU utilization, memory, and
-disk latency leave sufficient headroom. Parallel execution does not change
-simulated time, but it can distort wall-time estimates.
+If the server restarts, rerun the same `docker exec` command. Resume validation
+prevents completed cases from being silently reused with different inputs.
 
-## 10. Collect and transfer results
+## 8. Result layout
 
-Preserve the entire run directory. At minimum, every completed case must have:
+```text
+<run-root>/
+  manifest.json
+  pilot.json
+  summary.csv
+  summary.json
+  configs/
+  workloads/
+    *.jsonl
+    *.summary.json
+  runs/<case>/
+    cluster_config.json
+    workload.summary.json
+    command.txt
+    run.log
+    record.json
+    requests.csv
+    requests_kv_offload.csv
+    host_timing.json
+```
 
-- `cluster_config.json` and `workload.summary.json`;
-- `command.txt`, `run.log`, `wall_seconds.txt`, and `exit_code.txt`;
-- `requests.csv` and any KV-offload metric sidecar produced by the simulator;
-- root and recursive submodule commit IDs.
+The manifest records the root and recursive submodule revisions. Each record
+contains input and output hashes, exit status, timeout state, wall time,
+simulated time, and transport digests.
 
-Archive the batch from the host:
+Rebuild summaries at any time without rerunning simulations:
 
 ```bash
-CPU_KV_RUN_ID=REPLACE_WITH_THE_SERVER_RUN_DIRECTORY
-tar -C outputs/cpu_kv_experiment/server \
-  -czf "cpu_kv_${CPU_KV_RUN_ID}.tar.gz" "${CPU_KV_RUN_ID}"
-sha256sum "cpu_kv_${CPU_KV_RUN_ID}.tar.gz" \
-  > "cpu_kv_${CPU_KV_RUN_ID}.tar.gz.sha256"
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root "${RUN_ROOT}" \
+  summarize
 ```
 
-Generated traces are deleted by default. Add `--no-cleanup-inputs` only for a
-single failing case because retained Chakra graphs can consume substantial
-disk space.
+Archive the complete run root:
 
-## 11. Stop conditions and next decision
-
-Stop the batch and inspect the log when:
-
-- ASTRA-Sim or Chakra exits nonzero;
-- no request progress occurs for 30 simulated seconds while work is waiting;
-- the same configuration times out twice;
-- the server approaches its memory or disk limit.
-
-After Gate 2, compare throughput, p95/p99 latency, CPU hit rate, recomputed
-prompt tokens, migrated bytes, and capacity drops. Run longer workloads and
-additional seeds only for Recompute, the apparent knee, one point below the
-knee, and the maximum-capacity reference.
+```bash
+tar -C "$(dirname "${RUN_ROOT}")" \
+  -czf "cpu_kv_${RUN_ID}.tar.gz" "$(basename "${RUN_ROOT}")"
+sha256sum "cpu_kv_${RUN_ID}.tar.gz" \
+  > "cpu_kv_${RUN_ID}.tar.gz.sha256"
+```

@@ -480,8 +480,8 @@ step. A step is complete only after its focused validation passes.
   H2D reload; only the eviction and reload generate CPU migration traces.
 - 2026-07-20: Completed Step 6. PD prefill completion now includes its first
   generated token in the global throughput counter. Final summaries report
-  TTFT, TPOT, and ITL p50/p95/p99. When `--output` is set, the unchanged
-  per-request CSV is accompanied by an instance-level `*_kv_offload.csv`
+  TTFT, TPOT, and ITL p50/p95/p99. When `--output` is set, the per-request CSV
+  is accompanied by an instance-level `*_kv_offload.csv`
   containing preemptions, migration batches/bytes/time, reload stalls,
   NPU/CPU used and reserved peaks, and PD handoff count/bytes/wait time. The
   focused suite passes 37 tests. The final ASTRA-Sim matrix uses two requests
@@ -492,3 +492,12 @@ step. A step is complete only after its focused validation passes.
   8 generated tokens. Unit cases additionally cover repeated pressure, LRU
   and largest-KV victim order, exhausted CPU capacity, cross-node rejection,
   and unsupported prefix-cache combinations.
+- 2026-07-22: Added session identity, turn index, hit tier, and hit tokens to
+  the per-request CSV. Added a resumable server experiment runner that creates
+  deterministic workloads and capacity configs, executes the timing,
+  calibration, screen, and confirmation matrices, validates direct IPC against
+  transport oracle, and writes request/session and KV-offload summaries.
+- 2026-07-22: Added stage and load selection plus bounded case-level parallel
+  execution to the server runner. Each child uses one OpenMP/BLAS thread, and
+  analytical ASTRA-Sim now uses process-specific temporary memory-config
+  directories so independent cases can run safely at the same time.

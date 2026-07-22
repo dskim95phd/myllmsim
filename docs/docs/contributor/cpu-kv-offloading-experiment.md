@@ -103,7 +103,7 @@ A later sensitivity sweep may set `reused_prefix_toks` on 10% or 30% of turns.
 | Active offload | off | on | Isolate request-level CPU swapping |
 | Session offload | on | on | Evaluate the complete implementation |
 | NPU-only retention | on | off | Transfer-free cache reference at safe low load |
-| Oracle | on | on | Large CPU pool and near-zero host-link cost upper bound |
+| Capacity oracle | on | on | Large CPU pool and near-zero host-link cost upper bound |
 
 NPU-only retention is not used after its working set exceeds physical NPU
 capacity. A zero-capacity Session-offload run is also not used as the
@@ -141,8 +141,9 @@ provided a wall-clock estimate.
 ### Pilot-gated execution
 
 The publication matrix above is a target, not the first batch to launch. The
-timing pilot showed that the current trace-to-Chakra pipeline makes a
-1,000-session run a multi-hour job. Execute the experiment in three gates:
+analytical backend uses Chakra template IPC and direct in-memory execution by
+default. Retain the staged design so load stability and the capacity knee are
+established before spending time on the full matrix:
 
 1. **Load calibration:** use 20 sessions at session rates 0.5, 1.0, 1.5, and
    2.0 sessions/s for Recompute and 16 GiB Session offload. Stop any run that
@@ -154,13 +155,20 @@ timing pilot showed that the current trace-to-Chakra pipeline makes a
    only around the observed capacity knee. The 1,000-session, five-seed matrix
    is launched only if confidence intervals from the smaller runs require it.
 
-The July 2026 timing pilot estimates the original 135-run matrix at roughly
-17-101 days when executed serially. The wide interval reflects batching: a
-completed low-concurrency run cost 13.6-16.6 wall-clock seconds per LLM call,
-while a high-concurrency offload run achieved more batching but had not
-completed after 17.9 minutes. The proposed 50-session screening batch is
-expected to take approximately 2-12 hours serially. See the accompanying
-pilot report for the measurements and limitations.
+Before Gate 1, rerun 10-session Recompute and Session-offload timing cases with
+`--workload-transport ipc --ipc-execution direct` and record
+`--host-timing-output`. Use those measurements to publish a new wall-clock
+estimate. For one representative pressure workload, also run
+`--ipc-execution oracle` and require identical per-request results, simulated
+completion time, and KV-offload counters. Here, transport **oracle** is a
+correctness path that materializes every graph; it is unrelated to the
+Capacity oracle policy in the comparison table.
+
+The separate [Chakra template IPC validation](./chakra-template-ipc-plan.md)
+measured 4.92x and 7.12x direct-over-oracle median speedups on 50- and
+100-session PD cases, respectively, with exact simulated outputs. Run the
+CPU-KV-specific timing pilot before estimating the wall time of the capacity
+matrix.
 
 ## Metrics
 
@@ -218,16 +226,23 @@ Every result directory must retain:
 - workload JSONL and generator summary manifest;
 - cluster config, CLI arguments, seed, and git/submodule commits;
 - per-request CSV and KV-offload sidecar;
+- host-timing JSON, including transport/template counters and completion
+  sequence digests;
 - process wall time and simulator completion status.
 
-The container's installed Chakra package must match the checked-out Chakra
-submodule. Until the simulator image is rebuilt, copy or install the checked-
-out converter before an offload run and record that action in the manifest.
-Using an older installed converter can fail on migration-only traces even when
-the repository source already contains the required boundary handling.
+Run `scripts/compile.sh` after checkout and whenever the ASTRA-Sim or Chakra
+submodule revision changes. The script installs the checked-out Chakra fork
+and builds the analytical backend. Do not repair a stale container with an
+unrecorded manual converter copy.
 
-Before the publication-scale run, extend per-request output with `session_id`,
-`sub_request_index`, `session_kv_hit_tier`, and `session_kv_hit_tokens` so that
-turn-level and session-level results can be reconstructed. Aggregate sidecar
-metrics alone are sufficient for the pilot capacity and timing estimate but
-not for the final session-makespan report.
+The analytical experiment must explicitly record
+`--network-backend analytical --workload-transport ipc --ipc-execution direct`
+even though these are the current defaults. The file transport and transport-
+oracle modes are compatibility and correctness references, not publication
+performance configurations.
+
+The per-request output includes `session_id`, `sub_request_index`,
+`session_kv_hit_tier`, and `session_kv_hit_tokens`, allowing the experiment
+runner to reconstruct turn-level metrics and end-to-end session makespan. The
+aggregate sidecar remains the source for instance-level migration, occupancy,
+drop, and recomputation counters.

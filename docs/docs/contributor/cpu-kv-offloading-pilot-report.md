@@ -1,135 +1,156 @@
 ---
-title: CPU KV Offloading Timing Pilot Report
+title: CPU KV Offloading Pilot Readiness Report
 ---
 
-# CPU KV Offloading Timing Pilot Report
+# CPU KV Offloading Pilot Readiness Report
 
 ## Status
 
-This is a timing and feasibility gate, not a publication result. It validates
-the generated workload, demonstrates that CPU offloading changes progress
-under NPU pressure, and estimates the cost of the proposed sweep. It does not
-yet establish statistically significant throughput or latency improvements.
+The CPU KV offloading implementation and experiment harness are ready for a
+new timing and load-calibration pilot. The analytical backend uses Chakra
+template IPC, protocol-v2 system targeting, and direct in-memory execution by
+default. A transport-oracle run is used only to validate correctness.
 
-The pilot used commit state from the `agent/cpu-kv-offloading` branch on
-July 20, 2026. The workload and completed CSV are under
-`outputs/cpu_kv_experiment/pilot/seed7/`.
+No publication-scale capacity matrix should start until the pilot establishes
+the stable offered-load range and current wall-clock cost.
 
-## Workload
+## Experiment baseline
 
-The generator produced 100 sessions and 476 LLM calls at 2 sessions/s with
-seed 7 and the mixed gap profile.
+The pilot uses the following controlled setup:
 
-| Realized property | Value |
-| --- | ---: |
-| Mean turns/session | 4.76 |
-| Turns/session p90 | 9 |
-| Input tokens p50 / p90 / p99 | 2,412 / 6,178 / 9,440 |
-| Output tokens p50 / p90 | 129 / 330 |
-| Gap p50 / p90 / p99 | 0.38 / 17.34 / 208.37 s |
+| Parameter | Value |
+| --- | --- |
+| Model | `meta-llama/Llama-3.1-8B` |
+| Weight and KV dtype | BF16 |
+| NPU count / TP / PP | 1 / 1 / 1 |
+| NPU memory | 24 GiB |
+| CPU KV capacity | 16 GiB for the Session-offload case |
+| CPU memory bandwidth | 256 GB/s |
+| Host-link bandwidth / latency | 64 GB/s / 800 ns |
+| Host transfer model | `pipelined` |
+| KV block size | 16 tokens |
+| Session TTL | disabled |
 
-The same JSONL was used for every pilot. The setup was Llama-3.1-8B BF16 on
-one simulated 24 GiB RTXPRO6000. The offload case used a 16 GiB CPU KV pool,
-64 GB/s host link, 800 ns link latency, and 0.90/0.80 high/low watermarks.
+Use the session-KV workload generator with seed 7 and the mixed gap profile.
+Reuse the exact same JSONL file for Recompute and Session offload at each
+arrival rate.
 
-## Runs and observations
+## Current execution path
 
-| Run | Scope | Wall time | Outcome |
-| --- | --- | ---: | --- |
-| Recompute pressure pilot | 100 sessions | 214.4 s | Stopped after a persistent progress stall |
-| Session offload pressure pilot | 100 sessions, 16 GiB CPU | 1,075.4 s | Stopped after reaching 150 simulated seconds |
-| Recompute timing pilot | 10 sessions, 46 calls | 626.6 s | Simulation completed; legacy report code failed after summary |
-| Recompute smoke run | 1 session, 3 calls | 49.8 s | Completed and wrote the per-request CSV |
+Run performance cases with these settings recorded explicitly:
 
-### Recompute liveness at the offered load
+```text
+--network-backend analytical
+--workload-transport ipc
+--ipc-execution direct
+--host-timing-output <run-directory>/host_timing.json
+```
 
-The 100-session Recompute run reached 99.99% NPU memory at approximately 36
-simulated seconds. It then reported zero running requests while the waiting
-queue grew from 44 to 79 requests through simulated second 116. No tokens were
-processed during that interval, so the run was stopped.
+Direct execution registers structure-keyed Chakra templates and sends compact
+per-batch patches to ASTRA-Sim. It avoids matching per-batch trace and `.et`
+materialization. The host-timing JSON records template-cache activity, skipped
+graph work, IPC traffic, completion-sequence digests, and host-stage timing.
 
-This means 2 sessions/s cannot be treated as a valid stable Recompute load.
-It may also expose a scheduler liveness defect when all runnable KV has been
-preempted but memory remains committed. The load calibration gate must find a
-stable `lambda_sat`, and this state must be diagnosed before using overload
-completion rate as a scientific result.
+Run one representative Session-offload pressure case again with
+`--ipc-execution oracle`. The direct and oracle cases must have identical
+per-request output, final simulated time, KV-offload counters, and completion
+sequence. Host timing and transport counters are expected to differ.
 
-### Offload progress under the same pressure
+## Validation status
 
-The 16 GiB Session-offload run passed the Recompute stall point and continued
-to 150 simulated seconds. Selected occupancy samples were:
+The focused generator, session-retention, and KV-offloading suites contain 72
+tests. Run them before the pilot:
 
-| Simulated time | NPU used | CPU KV used | Waiting requests |
-| ---: | ---: | ---: | ---: |
-| 20 s | 89.4% | 3.63 GiB | 0 |
-| 40 s | 88.5% | 12.76 GiB | 22 |
-| 60 s | 82.0% | 15.34 GiB | 29 |
-| 70 s | 83.4% | 11.34 GiB | 19 |
-| 100 s | 81.7% | 6.27 GiB | 8 |
-| 130 s | 74.1% | 3.78 GiB | 0 |
+```bash
+python3 -m unittest \
+  tests.test_session_kv_generator \
+  tests.test_session_kv_retention \
+  tests.test_kv_offloading_foundation -q
+```
 
-The CPU pool therefore filled and later drained as state was restored or
-dropped, rather than growing monotonically. This is evidence that offloading
-preserves forward progress under this pressure. Because the run was stopped
-before all deferred turns completed, it is not valid to report an end-to-end
-speedup from this run.
+Run `scripts/compile.sh` after checkout and whenever the ASTRA-Sim or Chakra
+submodule revision changes. This installs the checked-out Chakra fork and
+builds the analytical backend. NS-3 is not required for this experiment.
 
-### Completed-run timing
+## Pilot sequence
 
-The 10-session run completed 46 calls in 626.6 wall-clock seconds, or 13.6
-seconds per call. The one-session smoke run completed three calls in 49.8
-seconds, or 16.6 seconds per call. These similar values show that graph
-generation and Chakra conversion per decode iteration dominate small-run wall
-time. High-load batching should lower the per-call cost, but migration traces
-add work in the offload cases.
+Run the complete sequence with:
 
-The one-session CSV reports 5.462 simulated seconds for three calls, with mean
-TTFT 68.21 ms and mean TPOT 11.42 ms. These values only validate output
-generation; the sample is too small for a performance conclusion.
+```bash
+python3 scripts/run_cpu_kv_experiment.py \
+  --run-root outputs/cpu_kv_experiment/server/RUN_ID \
+  pilot
+```
 
-## Tooling findings
+The runner generates all workloads and derived capacity configs, validates
+direct execution against transport oracle, and writes `pilot.json`,
+`summary.csv`, and resumable per-case records.
 
-Two experiment-harness issues were found:
+On a multicore server, keep Gate 0 serial and split the remaining pilot into
+`--stages calibration`, `--stages screen`, and `--stages validation` commands
+using the same run root. Calibration and screen accept `--workers N` before
+the `pilot` subcommand. Confirmation can be split with `--loads low`,
+`--loads high`, and `--loads overload`. The complete copy-and-run commands and
+worker sizing guidance are in the
+[server runbook](/docs/contributor/cpu-kv-offloading-server-runbook).
 
-1. The simulator image contained an older installed Chakra converter than the
-   checked-out submodule. Migration-only traces failed until the repository
-   converter was copied into the ephemeral container. The image should be
-   rebuilt before the main batch.
-2. `--log-interval` values above one second used integer floor division for
-   throughput scaling. That produced zero interval throughput and a division-
-   by-zero failure during final reporting. The working tree now uses a floating
-   scale, and a one-session end-to-end run with a 10-second interval completed
-   successfully.
+### Gate 0: current wall-clock timing
 
-The generator, session retention, and offloading unit suites contain 72 tests
-and all pass after the reporting fix.
+Generate one 10-session workload and run paired Recompute and 16 GiB Session-
+offload cases using direct IPC. Record:
 
-## Runtime estimate
+- total wall time and completed LLM calls;
+- host-stage timing and Chakra graphs skipped;
+- IPC bytes and template-cache hits, misses, registrations, and evictions;
+- final simulated time and completion-sequence digest.
 
-The original main matrix contains about 135 runs of 1,000 sessions each. A
-linear estimate from the completed 10-session timing run is about 17.4 hours
-per run and 98 days serially. High-load batching provides a more optimistic
-lower bound of roughly 3 hours per run, based on the partial pressure pilot.
-The practical planning range is therefore:
+Use these measurements only to size the next server batch. Do not extrapolate
+the publication matrix until the load-calibration cases finish.
 
-| Scope | Estimated serial time |
-| --- | ---: |
-| One 1,000-session run | 3-18 hours |
-| Original 135-run matrix | 17-101 days |
-| Original matrix with 8 ideal workers | 2-13 days, plus contention |
-| Proposed 50-session screening batch | 2-12 hours |
+### Gate 1: offered-load calibration
 
-The full matrix should not be started now. The recommended next action is the
-load-calibration gate followed by the 50-session screening batch. Only the
-capacity knee and adjacent points should then receive additional seeds and
-longer workloads.
+Generate 20-session workloads at 0.5, 1.0, 1.5, and 2.0 sessions/s. Run paired
+Recompute and 16 GiB Session-offload cases for every rate. The largest
+Recompute rate that completes without persistent no-progress behavior is the
+provisional saturation rate, `lambda_sat`.
+
+Select low and high rates near `0.6 * lambda_sat` and `0.9 * lambda_sat`.
+Generate new workloads at those exact rates instead of reusing a workload with
+a different arrival process.
+
+### Gate 2: capacity screen
+
+At the selected low and high loads, run 50 sessions with CPU capacities 4, 16,
+64, and 256 GiB. Include paired Recompute and Active-offload references. Add
+8, 32, and 128 GiB or more seeds only around the observed capacity knee.
+
+## Required pilot outputs
+
+Every case must preserve:
+
+- workload JSONL and generator summary;
+- cluster configuration and exact CLI command;
+- root and recursive submodule revisions;
+- per-request CSV and KV-offload sidecar;
+- host-timing JSON;
+- process log, wall time, exit status, and simulator completion status.
+
+The per-request CSV includes `session_id`, `sub_request_index`,
+`session_kv_hit_tier`, and `session_kv_hit_tokens`. The runner uses these fields
+to report request/session latency and session makespan, while the aggregate
+sidecar supplies migration, hit, miss, recomputation, and capacity-drop
+counters.
 
 ## Decision gate
 
-Proceed only after reviewing these points:
+Proceed to longer workloads only when:
 
-- accept the staged 20/50-session design instead of immediately launching the
-  1,000-session matrix;
-- diagnose or explicitly classify the Recompute no-progress state;
-- rebuild the simulator image with the current Chakra submodule;
-- add per-turn session identifiers and hit-tier fields before the final report.
+- direct and transport-oracle outputs match on the representative pressure
+  case;
+- the low and high stable offered loads are identified;
+- all selected configurations complete without unexplained no-progress
+  intervals;
+- host timing confirms that the direct path is skipping matching per-batch
+  Chakra graph generation; and
+- the 50-session screen identifies a capacity knee worth confirming with more
+  seeds.

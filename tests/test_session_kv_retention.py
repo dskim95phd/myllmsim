@@ -1,4 +1,7 @@
+import csv
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 from serving.__main__ import (
@@ -10,6 +13,40 @@ from serving.core.memory_model import MemoryModel, NodeCPUKVPool
 from serving.core.request import Batch, KVResidency, Request
 from serving.core.router import Router
 from serving.core.scheduler import KVOffloadStats, Scheduler
+
+
+class SessionKVOutputTest(unittest.TestCase):
+    def test_per_request_output_contains_session_metadata(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.done = [SimpleNamespace(
+            instance_id=0,
+            id=7,
+            session_id="session-7",
+            sub_request_index=2,
+            session_kv_hit_tier="CPU",
+            session_kv_hit_tokens=96,
+            model="test/model",
+            input=128,
+            output=160,
+            arrival=10,
+            end_time=30,
+            latency=20,
+            queuing_delay=4,
+            ttft=6,
+            tpot=1,
+            itl=[1, 1],
+        )]
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "requests.csv"
+            scheduler.save_output(str(output))
+            with output.open(newline="", encoding="utf-8") as output_file:
+                row = next(csv.DictReader(output_file))
+
+        self.assertEqual(row["session id"], "session-7")
+        self.assertEqual(row["sub request index"], "2")
+        self.assertEqual(row["session kv hit tier"], "CPU")
+        self.assertEqual(row["session kv hit tokens"], "96")
 
 
 class _Logger:
