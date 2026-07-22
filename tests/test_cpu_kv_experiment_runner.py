@@ -26,7 +26,6 @@ class CPUKVExperimentRunnerTest(unittest.TestCase):
         self.assertEqual(config4["nodes"][0]["cpu_mem"]["mem_size"], 4)
         self.assertEqual(config32["nodes"][0]["cpu_mem"]["mem_size"], 32)
         self.assertEqual(configs["active16"], runner.ACTIVE_CONFIG)
-        self.assertEqual(configs["npu_retention"], runner.NPU_RETENTION_CONFIG)
         self.assertEqual(configs["capacity_oracle"], runner.CAPACITY_ORACLE_CONFIG)
 
     def test_request_metrics_reconstruct_session_makespan(self):

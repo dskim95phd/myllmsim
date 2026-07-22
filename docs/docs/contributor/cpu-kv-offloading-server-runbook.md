@@ -108,7 +108,7 @@ The pilot performs the following steps without manual config editing:
 1. paired 10-session Recompute and 16 GiB Session-offload timing runs;
 2. paired 20-session calibration runs at 0.5, 1.0, 1.5, and 2.0 sessions/s;
 3. low/high 50-session screens for Recompute, Active offload, Session offload
-   at 4/16/64/256 GiB, NPU-only retention at low load, and Capacity oracle;
+   at 4/16/64/256 GiB, and Capacity oracle;
 4. one high-load 16 GiB Session-offload transport-oracle run;
 5. exact comparison of direct/oracle request CSV, KV sidecar, simulated clock,
    and completion-sequence digests.
@@ -194,7 +194,7 @@ python3 scripts/run_cpu_kv_experiment.py \
 
 Each `(load, seed)` workload is generated once and reused by every policy and
 capacity. The matrix includes Recompute, Active offload, Session offload,
-Capacity oracle, and the low-load NPU-retention reference.
+and Capacity oracle.
 
 To use a smaller confirmation before the full matrix:
 

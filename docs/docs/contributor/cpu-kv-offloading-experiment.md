@@ -102,12 +102,10 @@ A later sensitivity sweep may set `reused_prefix_toks` on 10% or 30% of turns.
 | Recompute | off | off | Full-prefill reference for every turn |
 | Active offload | off | on | Isolate request-level CPU swapping |
 | Session offload | on | on | Evaluate the complete implementation |
-| NPU-only retention | on | off | Transfer-free cache reference at safe low load |
 | Capacity oracle | on | on | Large CPU pool and near-zero host-link cost upper bound |
 
-NPU-only retention is not used after its working set exceeds physical NPU
-capacity. A zero-capacity Session-offload run is also not used as the
-Recompute baseline because these policies have different progress semantics.
+A zero-capacity Session-offload run is not used as the Recompute baseline
+because these policies have different progress semantics.
 
 ## Primary sweeps
 

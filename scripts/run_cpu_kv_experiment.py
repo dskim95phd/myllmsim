@@ -29,7 +29,6 @@ CONFIG_ROOT = REPO_ROOT / "configs" / "cluster"
 RECOMPUTE_CONFIG = CONFIG_ROOT / "single_node_session_kv_experiment_recompute.json"
 OFFLOAD_CONFIG = CONFIG_ROOT / "single_node_session_kv_experiment_offload_16gb.json"
 ACTIVE_CONFIG = CONFIG_ROOT / "single_node_session_kv_experiment_active_offload_16gb.json"
-NPU_RETENTION_CONFIG = CONFIG_ROOT / "single_node_session_kv_experiment_npu_retention.json"
 CAPACITY_ORACLE_CONFIG = CONFIG_ROOT / "single_node_session_kv_experiment_capacity_oracle.json"
 ASTRA_BINARY = (
     REPO_ROOT / "astra-sim" / "build" / "astra_analytical" / "build" /
@@ -130,7 +129,6 @@ def _prepare_configs(run_root: Path, capacities) -> dict[str, Path]:
     paths = {
         "recompute": RECOMPUTE_CONFIG,
         "active16": ACTIVE_CONFIG,
-        "npu_retention": NPU_RETENTION_CONFIG,
         "capacity_oracle": CAPACITY_ORACLE_CONFIG,
     }
     base = _read_json(OFFLOAD_CONFIG)
@@ -146,7 +144,7 @@ def _prepare_configs(run_root: Path, capacities) -> dict[str, Path]:
 def _validate_environment() -> None:
     required = [
         RECOMPUTE_CONFIG, OFFLOAD_CONFIG, ACTIVE_CONFIG,
-        NPU_RETENTION_CONFIG, CAPACITY_ORACLE_CONFIG,
+        CAPACITY_ORACLE_CONFIG,
         PROFILE_ROOT / "dense.csv", PROFILE_ROOT / "per_sequence.csv",
         PROFILE_ROOT / "attention.csv", ASTRA_BINARY,
     ]
@@ -610,9 +608,6 @@ def _pilot(args, run_root: Path) -> None:
             policies.extend(
                 ("session-offload", configs[f"session{capacity}"], capacity)
                 for capacity in args.screen_capacities)
-            if load == "low":
-                policies.append(
-                    ("npu-retention", configs["npu_retention"], None))
             for policy, config, capacity in policies:
                 capacity_label = (
                     f"_{capacity}gb" if capacity is not None else "")
@@ -705,8 +700,6 @@ def _confirm(args, run_root: Path) -> None:
             policies.extend(
                 ("session-offload", configs[f"session{capacity}"], capacity)
                 for capacity in args.capacities)
-            if load == "low":
-                policies.append(("npu-retention", configs["npu_retention"], None))
             for policy, config, capacity in policies:
                 capacity_label = f"_{capacity}gb" if capacity is not None else ""
                 label = (
