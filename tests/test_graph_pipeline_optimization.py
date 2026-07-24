@@ -20,7 +20,11 @@ from serving.core.chakra_template import (
     _runtime_source_for_node,
     _runtime_value_from_trace,
 )
-from serving.core.graph_generator import generate_graph
+from serving.core.config_builder import (
+    _compute_network_dims,
+    _resolve_dp_groups,
+)
+from serving.core.graph_generator import generate_graph, _load_llm_converter
 from serving.core.host_timing import HostTimingRecorder, timed_stage
 from serving.core.router import Router
 from serving.core.trace_generator import (
@@ -56,6 +60,33 @@ class ModelConfigCacheTest(unittest.TestCase):
         self.assertIs(first, second)
         self.assertEqual(get_config.cache_info().misses, 1)
         self.assertEqual(get_config.cache_info().hits, 1)
+
+
+class DpPipelineTopologyTest(unittest.TestCase):
+    @staticmethod
+    def _instance(pp_size=2):
+        return {
+            "dp_group": "A",
+            "tp_size": 1,
+            "pp_size": pp_size,
+            "ep_size": 2,
+        }
+
+    def test_pp_dimension_is_preserved_and_excluded_from_collectives(self):
+        instances = [self._instance(), self._instance()]
+
+        _resolve_dp_groups(instances)
+
+        self.assertEqual(_compute_network_dims(instances), [1, 2, 2])
+        for instance in instances:
+            self.assertEqual(instance["tp_dim"], [True, False, False])
+            self.assertEqual(instance["ep_dim"], [False, False, True])
+
+    def test_dp_group_rejects_mixed_pp_layouts(self):
+        instances = [self._instance(2), self._instance(1)]
+
+        with self.assertRaisesRegex(ValueError, "pp_size mismatch"):
+            _resolve_dp_groups(instances)
 
 
 class CompiledProfileCacheTest(unittest.TestCase):
@@ -138,6 +169,56 @@ class BoundedTemplateCacheTest(unittest.TestCase):
 
 
 class InProcessGraphConversionTest(unittest.TestCase):
+    def test_pipeline_partitions_only_at_tensor_compatible_boundaries(self):
+        converter_class = _load_llm_converter(str(
+            Path("astra-sim/extern/graph_frontend/chakra").resolve()))
+        converter = object.__new__(converter_class)
+        layers = [
+            SimpleNamespace(
+                input_memory_size=10,
+                output_memory_size=10,
+                is_expert=False,
+                is_pim=False,
+            )
+            for _ in range(12)
+        ]
+        layers[2].output_memory_size = 30
+        layers[3].input_memory_size = 20
+
+        ends = converter.get_pipeline_partition_ends(layers, 4)
+
+        self.assertEqual(ends[0], 0)
+        self.assertEqual(ends[-1], len(layers))
+        self.assertEqual(len(ends), 5)
+        self.assertNotIn(3, ends)
+        for boundary in ends[1:-1]:
+            self.assertEqual(
+                layers[boundary - 1].output_memory_size,
+                layers[boundary].input_memory_size,
+            )
+
+    def test_pipeline_partitions_skip_expert_markers_without_tensor_fields(self):
+        converter_class = _load_llm_converter(str(
+            Path("astra-sim/extern/graph_frontend/chakra").resolve()))
+        converter = object.__new__(converter_class)
+        normal = lambda: SimpleNamespace(
+            input_memory_size=10,
+            output_memory_size=10,
+            is_expert=False,
+            is_pim=False,
+        )
+        marker = lambda: SimpleNamespace(is_expert=True, is_pim=False)
+        layers = [normal(), normal(), marker(), normal(), marker(), normal(),
+                  normal(), normal()]
+
+        ends = converter.get_pipeline_partition_ends(layers, 2)
+
+        self.assertEqual(ends[0], 0)
+        self.assertEqual(ends[-1], len(layers))
+        for boundary in ends[1:-1]:
+            self.assertFalse(layers[boundary - 1].is_expert)
+            self.assertFalse(layers[boundary].is_expert)
+
     def test_in_process_converter_receives_existing_trace_and_cleans_it(self):
         calls = []
 
@@ -419,7 +500,7 @@ class RuntimeTracePatchTest(unittest.TestCase):
             (
                 RuntimeTraceRow(
                     "embedding_0", 100, "REMOTE:0", 40, "LOCAL", 1000,
-                    "LOCAL", 80, "ALLREDUCE", 80, "NONE"),
+                    "LOCAL", 80, "ALLREDUCE:1,0,0", 380928, "NONE"),
                 RuntimeTraceMarker("EXPERT", "0", "ALLTOALL", 128),
                 RuntimeTraceMarker("EXPERT", "END", "ALLTOALL", 128),
             ),

@@ -10,16 +10,16 @@ from .run_paths import input_path
 # module because trace writers live across the codebase and import it
 # as the canonical row template.
 _FMT = (
-    "{:<30}"  # Layername
-    "{:<15}"  # comp_time
-    "{:<15}"  # input_loc
-    "{:<15}"  # input_size
-    "{:<15}"  # weight_loc
-    "{:<15}"  # weight_size
-    "{:<15}"  # output_loc
-    "{:<15}"  # output_size
-    "{:<15}"  # comm_type
-    "{:<15}"  # comm_size
+    "{:<30}\t"  # Layername
+    "{:<15}\t"  # comp_time
+    "{:<15}\t"  # input_loc
+    "{:<15}\t"  # input_size
+    "{:<15}\t"  # weight_loc
+    "{:<15}\t"  # weight_size
+    "{:<15}\t"  # output_loc
+    "{:<15}\t"  # output_size
+    "{:<15}\t"  # comm_type
+    "{:<15}\t"  # comm_size
     "{:<15}"  # misc
     "\n"
 )
@@ -44,12 +44,7 @@ def header():
         "weight_loc", "weight_size", "output_loc", "output_size",
         "comm_type", "comm_size", "misc",
     ]
-    ileft_list = [30, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15]
-    output = ""
-    for string, ileft in zip(string_list, ileft_list):
-        output += ('{0:<' + str(ileft) + '}').format(string)
-    output += '\n'
-    return output
+    return formatter(*string_list)
 
 
 def formatter(layername, comp_time, input_loc, input_size, weight_loc, weight_size, output_loc, output_size, comm_type, comm_size, misc):

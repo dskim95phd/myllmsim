@@ -158,7 +158,7 @@ def _validate_environment() -> None:
 
 def _ensure_workload(
         run_root: Path, name: str, sessions: int, rate: float, seed: int,
-        gap_profile: str, resume: bool) -> Path:
+        gap_profile: str, context_profile: str, resume: bool) -> Path:
     output = run_root / "workloads" / f"{name}.jsonl"
     summary = output.with_suffix(output.suffix + ".summary.json")
     expected = {
@@ -166,6 +166,7 @@ def _ensure_workload(
         "session_rate": rate,
         "seed": seed,
         "gap_profile": gap_profile,
+        "context_profile": context_profile,
         "first_arrival_sec": 0.0,
         "max_turns": 12,
         "turn_stop_prob": 0.25,
@@ -185,6 +186,7 @@ def _ensure_workload(
         seed=seed,
         output=str(output.resolve()),
         gap_profile=gap_profile,
+        context_profile=context_profile,
         first_arrival_sec=0.0,
         max_turns=12,
         turn_stop_prob=0.25,
@@ -237,6 +239,7 @@ def _run_case(
             "session_rate": rate,
             "seed": seed,
             "gap_profile": args.gap_profile,
+            "context_profile": args.context_profile,
             "execution": execution,
             "config_sha256": _sha256(config),
             "workload_sha256": _sha256(workload),
@@ -325,6 +328,7 @@ def _run_case(
         "session_rate": rate,
         "seed": seed,
         "gap_profile": args.gap_profile,
+        "context_profile": args.context_profile,
         "execution": execution,
         "runner_workers": args.workers,
         "command": command,
@@ -459,6 +463,8 @@ def _write_summary(run_root: Path):
             "sessions": record["sessions"],
             "session_rate": record["session_rate"],
             "seed": record["seed"],
+            "gap_profile": record.get("gap_profile"),
+            "context_profile": record.get("context_profile", "standard"),
             "execution": record["execution"],
             "completed": record["completed"],
             "returncode": record["returncode"],
@@ -471,6 +477,8 @@ def _write_summary(run_root: Path):
             **request_metrics,
         }
         for key in (
+                "preemption count", "recompute preemption count",
+                "recompute preemption bytes", "recompute preemption tokens",
                 "eviction batches", "reload batches", "evict bytes",
                 "reload bytes", "migration time ns", "reload stall ns",
                 "session npu hit count", "session npu hit tokens",
@@ -519,7 +527,8 @@ def _pilot(args, run_root: Path) -> None:
     if "timing" in stages:
         timing_workload = _ensure_workload(
             run_root, f"timing_seed{args.seed}", args.timing_sessions,
-            args.timing_rate, args.seed, args.gap_profile, args.resume)
+            args.timing_rate, args.seed, args.gap_profile,
+            args.context_profile, args.resume)
         timing_rate_label = _rate_label(args.timing_rate)
         timing_jobs = []
         for policy, config in (
@@ -543,7 +552,7 @@ def _pilot(args, run_root: Path) -> None:
             workload = _ensure_workload(
                 run_root, f"calibrate_rate_{rate_name}_seed{args.seed}",
                 args.calibration_sessions, rate, args.seed,
-                args.gap_profile, args.resume)
+                args.gap_profile, args.context_profile, args.resume)
             for policy, config in (
                     ("recompute", configs["recompute"]),
                     ("session-offload", configs["session16"])):
@@ -599,7 +608,7 @@ def _pilot(args, run_root: Path) -> None:
                 run_root,
                 f"screen_{load}_rate_{_rate_label(rate)}_seed{args.seed}",
                 args.screen_sessions, rate, args.seed,
-                args.gap_profile, args.resume)
+                args.gap_profile, args.context_profile, args.resume)
             policies = [
                 ("recompute", configs["recompute"], None),
                 ("active-offload", configs["active16"], 16),
@@ -645,7 +654,7 @@ def _pilot(args, run_root: Path) -> None:
             run_root,
             f"screen_high_rate_{_rate_label(high_rate)}_seed{screen_seed}",
             screen_sessions, high_rate, screen_seed,
-            screen_gap_profile, args.resume)
+            screen_gap_profile, args.context_profile, args.resume)
         oracle_label = (
             f"validate_high_rate_{_rate_label(high_rate)}_"
             "session_offload_16gb_oracle")
@@ -691,12 +700,15 @@ def _confirm(args, run_root: Path) -> None:
                 run_root,
                 f"confirm_{load}_rate_{_rate_label(rate)}_"
                 f"seed{seed}_sessions{args.sessions}",
-                args.sessions, rate, seed, args.gap_profile, args.resume)
-            policies = [
-                ("recompute", configs["recompute"], None),
-                ("active-offload", configs["active16"], 16),
-                ("capacity-oracle", configs["capacity_oracle"], 256),
-            ]
+                args.sessions, rate, seed, args.gap_profile,
+                args.context_profile, args.resume)
+            policies = []
+            if args.include_baselines:
+                policies.extend([
+                    ("recompute", configs["recompute"], None),
+                    ("active-offload", configs["active16"], 16),
+                    ("capacity-oracle", configs["capacity_oracle"], 256),
+                ])
             policies.extend(
                 ("session-offload", configs[f"session{capacity}"], capacity)
                 for capacity in args.capacities)
@@ -726,6 +738,8 @@ def _build_parser():
         help="number of independent simulator cases to run concurrently")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gap-profile", choices=("tool-heavy", "mixed", "human-heavy"), default="mixed")
+    parser.add_argument("--context-profile", choices=("standard", "long"),
+                        default="standard")
     parser.add_argument("--log-level", choices=("WARNING", "INFO", "DEBUG"), default="WARNING")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -758,6 +772,10 @@ def _build_parser():
     confirm.add_argument(
         "--capacities", type=lambda value: _parse_numbers(value, int),
         default=DEFAULT_CONFIRM_CAPACITIES)
+    confirm.add_argument(
+        "--include-baselines", action=argparse.BooleanOptionalAction,
+        default=True,
+        help="include recompute, active-offload, and capacity-oracle cases")
 
     subparsers.add_parser("summarize", help="rebuild summary.csv from run records")
     return parser

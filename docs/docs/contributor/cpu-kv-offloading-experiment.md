@@ -95,6 +95,19 @@ a comparison.
 Context truncation and summarization are excluded from the primary experiment.
 A later sensitivity sweep may set `reused_prefix_toks` on 10% or 30% of turns.
 
+The workload generator also exposes `--context-profile long` for a controlled
+long-context sensitivity run. It changes the initial-context distribution to
+a log-normal median of 8,192 tokens (range 4,096-16,384) and the per-turn new
+context distribution to a median of 2,048 tokens (range 256-8,192). The same
+32,768-token context ceiling, turn-count distribution, output distribution,
+arrival process, and gap profile are retained. Use a separate experiment run
+root because context profile is part of workload identity.
+
+For a follow-up capacity refinement that reuses completed baselines, pass
+`--no-include-baselines` to `confirm`. Only the requested Session-offload
+capacities are scheduled; the existing summary still includes earlier records
+from the same run root.
+
 ## Compared policies
 
 | Label | Session retention | CPU offloading | Purpose |
@@ -106,6 +119,12 @@ A later sensitivity sweep may set `reused_prefix_toks` on 10% or 30% of turns.
 
 A zero-capacity Session-offload run is not used as the Recompute baseline
 because these policies have different progress semantics.
+
+The Recompute policy still performs full prefill for every session turn. If
+active requests fill NPU KV capacity within a turn, the scheduler discards the
+lowest-priority request KV and rebuilds it to the saved logical token position
+before resuming. Rebuild work does not generate another output token, reset
+TTFT, or add duplicate prompt tokens to throughput.
 
 ## Primary sweeps
 
@@ -181,6 +200,7 @@ matrix.
 
 - NPU and CPU session hit count/tokens;
 - session misses and recomputed prompt tokens;
+- recompute preemption count, discarded KV bytes, and rebuilt KV tokens;
 - TTL expiration and capacity-drop count/bytes;
 - average parked occupancy from byte-ns divided by simulated duration.
 

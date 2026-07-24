@@ -138,12 +138,15 @@ def _resolve_dp_groups(all_instances):
             dp_groups.setdefault(dg, []).append(inst)
 
     for group_name, members in dp_groups.items():
-        # All members must have same tp_size and ep_size
+        # All members must have the same parallel layout.
         tp0 = members[0]["tp_size"]
+        pp0 = members[0]["pp_size"]
         ep0 = members[0]["ep_size"]
         for m in members[1:]:
             if m["tp_size"] != tp0:
                 raise ValueError(f"DP group '{group_name}': tp_size mismatch ({tp0} vs {m['tp_size']})")
+            if m["pp_size"] != pp0:
+                raise ValueError(f"DP group '{group_name}': pp_size mismatch ({pp0} vs {m['pp_size']})")
             if m["ep_size"] != ep0:
                 raise ValueError(f"DP group '{group_name}': ep_size mismatch ({ep0} vs {m['ep_size']})")
 
@@ -155,15 +158,21 @@ def _resolve_dp_groups(all_instances):
         if local_ep > tp0:
             raise ValueError(f"DP group '{group_name}': local_ep ({local_ep}) > tp_size ({tp0})")
 
-        # Topology dimensions for DP group: dim 0 = TP (intra-instance), dim 1 = DP (cross-instance)
-        # ALLREDUCE (TP): dim 0 only. ALLTOALL (EP): dim 1 (or both if EP spans TP+DP).
-        tp_dim = [True, False]  # ALLREDUCE on dim 0 only
+        # PP occupies physical systems but is excluded from collectives.
+        tp_dim = [True, False, False] if pp0 > 1 else [True, False]
         if ep_total <= tp0:
-            # EP fits within TP dimension (no cross-instance ALLTOALL)
-            ep_dim = [True, False]
+            ep_dim = (
+                [True, False, False] if pp0 > 1
+                else [True, False]
+            )
         else:
-            # EP spans both dimensions (cross-instance ALLTOALL)
-            ep_dim = [True, True] if tp0 > 1 else [False, True]
+            if pp0 > 1:
+                ep_dim = (
+                    [True, False, True] if tp0 > 1
+                    else [False, False, True]
+                )
+            else:
+                ep_dim = [True, True] if tp0 > 1 else [False, True]
 
         for m in members:
             m["dp_group_size"] = dp_size
@@ -198,11 +207,16 @@ def _compute_network_dims(instances):
             dp_groups.setdefault(dg, []).append(inst)
 
     if dp_groups:
-        # DP group mode: topology = [tp_size, dp_group_size]
+        # Keep PP as an explicit physical dimension when it is present.
         # All instances in DP group must have same tp_size (validated by
         # _resolve_dp_groups).
         first_group = next(iter(dp_groups.values()))
-        dims = [first_group[0]["tp_size"], len(first_group)]
+        tp_size = first_group[0]["tp_size"]
+        pp_size = first_group[0]["pp_size"]
+        dims = (
+            [tp_size, pp_size, len(first_group)]
+            if pp_size > 1 else [tp_size, len(first_group)]
+        )
     else:
         # Independent instances: standard topology.
         total_npu = sum(
@@ -736,7 +750,9 @@ def _create_network_config(network_config_path, instances, link_bw, link_latency
     """Create ASTRA-Sim network topology config.
 
     Topology dimensions:
-      - For DP groups: [tp_size, dp_group_size] — dim 0 for TP ALLREDUCE, dim 1 for EP ALLTOALL
+      - For DP groups without PP: [tp_size, dp_group_size]
+      - For DP groups with PP: [tp_size, pp_size, dp_group_size]
+        PP is a physical dimension but is excluded from TP/EP collectives.
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
     """

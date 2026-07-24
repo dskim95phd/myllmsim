@@ -14,6 +14,13 @@ class CPUKVExperimentRunnerTest(unittest.TestCase):
             ("calibration", "screen"))
         self.assertEqual(runner._parse_loads("low,overload"), ("low", "overload"))
 
+    def test_confirmation_baselines_can_be_disabled(self):
+        parser = runner._build_parser()
+        args = parser.parse_args([
+            "--run-root", "outputs/test", "confirm", "--no-include-baselines",
+        ])
+        self.assertFalse(args.include_baselines)
+
     def test_prepare_configs_builds_requested_session_capacities(self):
         with tempfile.TemporaryDirectory(dir=runner.REPO_ROOT) as directory:
             run_root = Path(directory)

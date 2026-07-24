@@ -133,6 +133,9 @@ class Request:
         self.is_init = is_init
         self.original_input = input
         self.num_computed_tokens = 0  # Tracks actual computed tokens (vLLM style)
+        # When live KV is discarded, rebuild it through this logical token
+        # position before generating another output token.
+        self.recompute_kv_target_tokens = None
         # ``evict`` is retained for compatibility with the existing scheduler
         # paths. New CPU-offload code uses ``kv_residency`` as the source of
         # truth and keeps the two values synchronized.
@@ -214,7 +217,41 @@ class Request:
     
     def is_prefill(self):
         """Check if request is still in prefill phase (has tokens left to compute)"""
-        return self.num_computed_tokens < self.original_input
+        return self.num_computed_tokens < self.prefill_target_tokens()
+
+    def prefill_target_tokens(self):
+        if self.recompute_kv_target_tokens is not None:
+            return self.recompute_kv_target_tokens
+        return self.original_input
+
+    def begin_recompute_preemption(self):
+        """Discard live KV while preserving logical generation progress."""
+        if self.num_computed_tokens <= 0:
+            raise RuntimeError(
+                f"Request #{self.id} has no computed KV to discard.")
+        if self.kv_residency is not KVResidency.NPU:
+            raise RuntimeError(
+                f"Request #{self.id} cannot be recompute-preempted from "
+                f"{self.kv_residency.name} residency.")
+        target_tokens = self.num_computed_tokens
+        self.recompute_kv_target_tokens = target_tokens
+        self.num_computed_tokens = 0
+        self.chunk_len = 0
+        self.prefix_cache_hit = 0
+        self.npu_cache_hit = 0
+        self.storage_cache_hit = 0
+        return target_tokens
+
+    def finish_recompute_prefill(self):
+        if self.recompute_kv_target_tokens is None:
+            raise RuntimeError(
+                f"Request #{self.id} has no recompute prefill to finish.")
+        if self.num_computed_tokens < self.recompute_kv_target_tokens:
+            raise RuntimeError(
+                f"Request #{self.id} has rebuilt only "
+                f"{self.num_computed_tokens} of "
+                f"{self.recompute_kv_target_tokens} tokens.")
+        self.recompute_kv_target_tokens = None
 
     def is_kv_on_cpu(self):
         return self.kv_residency is KVResidency.CPU

@@ -13,6 +13,7 @@ class SessionKVGeneratorTest(unittest.TestCase):
             "seed": 7,
             "output": "unused.jsonl",
             "gap_profile": "mixed",
+            "context_profile": "standard",
             "first_arrival_sec": 0.0,
             "max_turns": 12,
             "turn_stop_prob": 0.25,
@@ -57,6 +58,23 @@ class SessionKVGeneratorTest(unittest.TestCase):
     def test_invalid_rate_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "session_rate"):
             generate_sessions(self._args(session_rate=0))
+
+    def test_long_context_profile_produces_larger_final_contexts(self):
+        standard = generate_sessions(self._args(num_sessions=100))
+        long_context = generate_sessions(self._args(
+            num_sessions=100, context_profile="long"))
+
+        standard_mean = sum(
+            session["sub_requests"][-1]["input_toks"]
+            for session in standard) / len(standard)
+        long_mean = sum(
+            session["sub_requests"][-1]["input_toks"]
+            for session in long_context) / len(long_context)
+
+        self.assertGreater(long_mean, standard_mean * 3)
+        self.assertTrue(all(
+            session["sub_requests"][-1]["input_toks"] <= 32768
+            for session in long_context))
 
 
 if __name__ == "__main__":

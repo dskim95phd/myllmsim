@@ -1,20 +1,47 @@
 import csv
 import unittest
+from collections import deque
 from tempfile import TemporaryDirectory
 from pathlib import Path
 from types import SimpleNamespace
 
 from serving.core.memory_model import Device, MemoryModel, NodeCPUKVPool
-from serving.core.request import Batch, BatchKind, KVResidency, Request
+from serving.core.request import (
+    Batch,
+    BatchKind,
+    KVResidency,
+    Request,
+    SessionKVState,
+)
 from serving.core.router import Router
 from serving.core.scheduler import Scheduler
 from serving.core.trace_generator import generate_trace
 from serving.core.config_builder import _host_transfer_config
 from serving.__main__ import (
     _build_instance_runtime_configs,
+    _dp_execution_idle,
     _kv_offload_output_file,
+    _monotonic_event_time,
     _validate_kv_offload_node_scope,
 )
+
+
+class SimulationTimeSafetyTest(unittest.TestCase):
+    def test_event_time_never_moves_backward(self):
+        self.assertEqual(_monotonic_event_time(100, 250), 250)
+        self.assertEqual(_monotonic_event_time(250, 100), 250)
+
+    def test_dp_execution_is_not_idle_with_pending_or_active_waves(self):
+        pending = {"A": {0: deque(), 1: deque()}}
+        active = {"A": {}}
+        self.assertTrue(_dp_execution_idle(pending, active))
+
+        pending["A"][0].append(object())
+        self.assertFalse(_dp_execution_idle(pending, active))
+        pending["A"][0].clear()
+
+        active["A"][3] = 1
+        self.assertFalse(_dp_execution_idle(pending, active))
 
 
 class KVResidencyTest(unittest.TestCase):
@@ -387,6 +414,7 @@ class MigrationBatchTest(unittest.TestCase):
         scheduler.max_num_seqs = 8
         scheduler.prioritize_prefill = False
         scheduler.enable_chunked_prefill = True
+        scheduler.enable_prefix_caching = False
         scheduler.max_num_batched_tokens = 8
         scheduler.long_prefill_token_threshold = 0
         scheduler.enable_kv_offloading = True
@@ -398,6 +426,101 @@ class MigrationBatchTest(unittest.TestCase):
             lambda requests, count, scheduled_tokens=None: new_kv_size if count else 0)
         scheduler.memory.get_evict_kv = lambda req: 8
         return scheduler, pool
+
+    def test_recompute_preemption_discards_kv_and_preserves_progress(self):
+        scheduler, _ = self._pressure_scheduler(100, 1)
+        scheduler.enable_kv_offloading = False
+        older = Request(1, "test/model", 8, 32, 0, 0)
+        newer = Request(2, "test/model", 8, 32, 1, 0)
+        for request in (older, newer):
+            request.num_computed_tokens = 16
+            request.is_init = False
+        scheduler.request = [older, newer]
+
+        batch = scheduler.schedule_base(10, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.kind, BatchKind.COMPUTE)
+        self.assertIn(older, batch.requests)
+        self.assertEqual(older.num_computed_tokens, 16)
+        self.assertEqual(newer.num_computed_tokens, 0)
+        self.assertEqual(newer.recompute_kv_target_tokens, 16)
+        self.assertTrue(newer.is_prefill())
+        self.assertEqual(scheduler.memory.npu_used, 93)
+        stats = scheduler.get_kv_offload_stats()
+        self.assertEqual(stats["preemption_count"], 1)
+        self.assertEqual(stats["recompute_preemption_count"], 1)
+        self.assertEqual(stats["recompute_preemption_bytes"], 8)
+        self.assertEqual(stats["recompute_preemption_tokens"], 16)
+
+    def test_full_offload_tiers_fall_back_to_recompute_preemption(self):
+        scheduler, pool = self._pressure_scheduler(100, 1)
+        pool.capacity = 0
+        request = Request(1, "test/model", 8, 32, 0, 0)
+        request.num_computed_tokens = 16
+        request.is_init = False
+        scheduler.request = [request]
+
+        batch = scheduler.schedule_base(10, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.kind, BatchKind.COMPUTE)
+        self.assertEqual([req.id for req in batch.requests], [request.id])
+        self.assertEqual(request.num_computed_tokens, 0)
+        self.assertEqual(request.recompute_kv_target_tokens, 16)
+        self.assertEqual(scheduler.memory.npu_used, 93)
+        stats = scheduler.get_kv_offload_stats()
+        self.assertEqual(stats["recompute_preemption_count"], 1)
+        self.assertEqual(stats["recompute_preemption_bytes"], 8)
+        self.assertEqual(stats["recompute_preemption_tokens"], 16)
+
+    def test_recompute_prefill_does_not_duplicate_token_throughput(self):
+        scheduler, _ = self._pressure_scheduler(60, 1)
+        scheduler.enable_kv_offloading = False
+        request = Request(1, "test/model", 8, 16, 0, 0)
+        request.num_computed_tokens = 8
+        request.is_init = False
+        request.ttft = 5
+        request.begin_recompute_preemption()
+        request.chunk_len = 8
+        batch = Batch(
+            0, "test/model", 8, 0, [8], [], 1, 0,
+            [8], [0], [], 10, 0)
+        batch.requests.append(request)
+        batch.fired.append(0)
+        scheduler.inflight.append(batch)
+
+        prompt_tokens, generated_tokens, finished = scheduler.add_done(
+            1, 0, 20)
+
+        self.assertEqual(prompt_tokens, 0)
+        self.assertEqual(generated_tokens, 0)
+        self.assertEqual(finished, [])
+        self.assertEqual(request.num_computed_tokens, 8)
+        self.assertIsNone(request.recompute_kv_target_tokens)
+        self.assertEqual(request.ttft, 5)
+
+    def test_partial_prefill_can_be_recompute_preempted(self):
+        scheduler, _ = self._pressure_scheduler(100, 1)
+        scheduler.enable_kv_offloading = False
+        older = Request(1, "test/model", 32, 8, 0, 0)
+        newer = Request(2, "test/model", 32, 8, 1, 0)
+        for request in (older, newer):
+            request.num_computed_tokens = 8
+        scheduler.request = [older, newer]
+
+        batch = scheduler.schedule_base(10, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertIn(older, batch.requests)
+        self.assertEqual(newer.num_computed_tokens, 0)
+        self.assertEqual(newer.recompute_kv_target_tokens, 8)
+        self.assertTrue(newer.is_init)
+
+        newer.num_computed_tokens = 8
+        newer.finish_recompute_prefill()
+        self.assertTrue(newer.is_prefill())
+        self.assertEqual(newer.prefill_target_tokens(), 32)
 
     def test_pressure_emits_migration_without_releasing_source(self):
         scheduler, pool = self._pressure_scheduler(95, 10)
@@ -424,6 +547,92 @@ class MigrationBatchTest(unittest.TestCase):
         self.assertIsNotNone(batch)
         self.assertEqual(batch.kind, BatchKind.COMPUTE)
         self.assertEqual(scheduler.memory.npu_used, 91)
+
+    def test_chunked_prefill_shrinks_to_remaining_physical_capacity(self):
+        scheduler, pool = self._pressure_scheduler(95, 8)
+        pool.capacity = 0
+        scheduler.memory.get_block_kv = (
+            lambda requests, count, scheduled_tokens=None:
+                sum(scheduled_tokens[req.id] for req in requests[:count]))
+        prefill = Request(1, "test/model", 8, 16, 0, 0)
+        scheduler.request = [prefill]
+
+        batch = scheduler.schedule_base(0, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.kind, BatchKind.COMPUTE)
+        self.assertEqual(batch.total_len, 5)
+        self.assertEqual(prefill.chunk_len, 5)
+        self.assertEqual(scheduler.memory.npu_used, 100)
+
+    def test_full_tiers_drop_oldest_parked_npu_session_for_progress(self):
+        scheduler, pool = self._pressure_scheduler(100, 1)
+        pool.capacity = 0
+        prefill = Request(1, "test/model", 8, 16, 0, 0)
+        scheduler.request = [prefill]
+        scheduler.session_kv_states["old-session"] = SessionKVState(
+            session_id="old-session",
+            model_name="test/model",
+            sub_request_index=0,
+            source_request_id=9,
+            cached_tokens=8,
+            bytes_per_rank=8,
+            bytes_full_cluster=8,
+            residency=KVResidency.NPU,
+            owner_node_id=0,
+            owner_instance_id=0,
+            num_npus=1,
+            tp_size=1,
+            block_size=16,
+            kv_fp=2,
+            parked_at_ns=0,
+            expires_at_ns=None,
+            last_access_ns=0,
+        )
+
+        batch = scheduler.schedule_base(10, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.kind, BatchKind.COMPUTE)
+        self.assertNotIn("old-session", scheduler.session_kv_states)
+        self.assertEqual(scheduler.memory.npu_used, 93)
+        stats = scheduler.get_kv_offload_stats()
+        self.assertEqual(stats["session_capacity_drop_count"], 1)
+        self.assertEqual(stats["session_capacity_drop_bytes"], 8)
+
+    def test_failed_mandatory_offload_reschedules_after_session_drop(self):
+        scheduler, pool = self._pressure_scheduler(100, 1)
+        scheduler.pd_type = "decode"
+        pool.capacity = 0
+        prefill = Request(1, "test/model", 8, 16, 0, 0)
+        scheduler.request = [prefill]
+        scheduler.session_kv_states["mandatory"] = SessionKVState(
+            session_id="mandatory",
+            model_name="test/model",
+            sub_request_index=0,
+            source_request_id=9,
+            cached_tokens=8,
+            bytes_per_rank=8,
+            bytes_full_cluster=8,
+            residency=KVResidency.NPU,
+            owner_node_id=0,
+            owner_instance_id=0,
+            num_npus=1,
+            tp_size=1,
+            block_size=16,
+            kv_fp=2,
+            parked_at_ns=0,
+            expires_at_ns=None,
+            last_access_ns=0,
+            mandatory_cpu_offload=True,
+        )
+
+        batch = scheduler.schedule_base(10, 0)
+
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.kind, BatchKind.COMPUTE)
+        self.assertNotIn("mandatory", scheduler.session_kv_states)
+        self.assertEqual(scheduler.memory.npu_used, 93)
 
     def test_only_runnable_decode_is_not_evicted(self):
         scheduler, _ = self._pressure_scheduler(85, 1)
@@ -514,7 +723,7 @@ class MigrationBatchTest(unittest.TestCase):
         self.assertEqual(batch.migrations[0].request_id, older.id)
         self.assertEqual(pool.reserved, 8)
 
-    def test_failed_admission_does_not_mutate_request_or_memory(self):
+    def test_full_cpu_tier_recompute_preempts_instead_of_stalling(self):
         scheduler, pool = self._pressure_scheduler(95, 10)
         pool.capacity = 0
         prefill = Request(1, "test/model", 8, 16, 0, 0)
@@ -525,16 +734,20 @@ class MigrationBatchTest(unittest.TestCase):
 
         batch = scheduler.schedule_base(0, 0)
 
-        self.assertIsNone(batch)
-        self.assertEqual(prefill.chunk_len, 0)
-        self.assertEqual(prefill.queuing_delay, -1)
+        self.assertIsNotNone(batch)
+        self.assertEqual(batch.kind, BatchKind.COMPUTE)
+        self.assertEqual([req.id for req in batch.requests], [1])
+        self.assertEqual(prefill.chunk_len, 8)
+        self.assertEqual(prefill.queuing_delay, 0)
         self.assertEqual(decode.kv_residency, KVResidency.NPU)
-        self.assertEqual([req.id for req in scheduler.request], [1, 2])
-        self.assertEqual(scheduler.memory.npu_used, 95)
+        self.assertEqual(decode.num_computed_tokens, 0)
+        self.assertEqual(decode.recompute_kv_target_tokens, 16)
+        self.assertEqual([req.id for req in scheduler.request], [2])
+        self.assertEqual(scheduler.memory.npu_used, 97)
         self.assertEqual(scheduler.memory.npu_reserved, 0)
         self.assertEqual(pool.used, 0)
         self.assertEqual(pool.reserved, 0)
-        self.assertEqual(scheduler.inflight, [])
+        self.assertEqual(scheduler.inflight, [batch])
 
     def test_evicted_request_is_not_immediately_reloaded_under_pressure(self):
         scheduler, _ = self._pressure_scheduler(95, 10)
@@ -769,6 +982,7 @@ class PDHandoffTest(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["instance id"], "1")
         self.assertEqual(rows[0]["preemption count"], "2")
+        self.assertEqual(rows[0]["recompute preemption count"], "0")
         self.assertEqual(rows[0]["evict bytes"], "40")
         self.assertEqual(rows[0]["reload bytes"], "20")
         self.assertEqual(rows[0]["pd handoff count"], "3")

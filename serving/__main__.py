@@ -133,6 +133,22 @@ def _next_idle_event(router, schedulers):
     return min(events) if events else None
 
 
+def _monotonic_event_time(current, event_time):
+    """Keep frontend time monotonic when completions arrive asynchronously."""
+    return max(current, event_time)
+
+
+def _dp_execution_idle(dp_pending, dp_active_systems):
+    """Return whether no queued or physically active DP wave remains."""
+    if any(active for active in dp_active_systems.values()):
+        return False
+    return not any(
+        queue
+        for group in dp_pending.values()
+        for queue in group.values()
+    )
+
+
 def _cleanup_inputs_root(run_paths, logger):
     """Remove generated ASTRA-Sim inputs after a completed simulation."""
     runs_root = os.path.abspath(os.path.join("inputs", "runs"))
@@ -870,29 +886,47 @@ def main():
     for dg, members in dp_groups.items():
         for inst_id in members:
             inst_dp_group[inst_id] = dg
-    # Pending batches per DP group (waiting for all members to schedule)
-    dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
+    # Pending batches per DP member. PP can produce more than one batch before
+    # a slower peer reaches the DP barrier, so each member needs a FIFO.
+    dp_pending = {
+        dg: {instance_id: deque() for instance_id in members}
+        for dg, members in dp_groups.items()
+    }
     # Direct waves include dummy batches that are intentionally absent from
     # Scheduler.inflight. Track physical completions separately so an idle
     # peer is not rescheduled or put to sleep before its wave has completed.
-    dp_active_systems = {dg: set() for dg in dp_groups}
+    dp_active_systems = {dg: defaultdict(int) for dg in dp_groups}
     # Pre-generated workloads ready to submit on next "Waiting"
     dp_ready_workloads = {}  # instance_id -> workload_path
     next_wave_id = 1
+
+    def dp_group_has_pending(dp_group):
+        return any(dp_pending[dp_group][member]
+                   for member in dp_groups[dp_group])
+
+    def dp_group_ready(dp_group):
+        return all(dp_pending[dp_group][member]
+                   for member in dp_groups[dp_group])
 
     def record_dp_system_completion(system_id):
         completed_instance_id = npu2inst_mapping[system_id]
         completed_dp_group = inst_dp_group.get(completed_instance_id)
         if completed_dp_group is None:
             return
-        dp_active_systems[completed_dp_group].discard(system_id)
+        active_count = dp_active_systems[completed_dp_group].get(
+            system_id, 0)
+        if active_count <= 1:
+            dp_active_systems[completed_dp_group].pop(system_id, None)
+        else:
+            dp_active_systems[completed_dp_group][system_id] = (
+                active_count - 1)
         completed_start = inst2npu_mapping[completed_instance_id]
         completed_end = instance_end_system(completed_instance_id) + 1
         member_still_active = any(
             active_system in dp_active_systems[completed_dp_group]
             for active_system in range(completed_start, completed_end)
         )
-        if (dp_pending[completed_dp_group] and
+        if (dp_group_has_pending(completed_dp_group) and
                 not member_still_active):
             queue_ready_system(completed_start)
 
@@ -900,11 +934,15 @@ def main():
         """Submit one complete DP wave through the selected execution path."""
         nonlocal direct_submission_started, next_wave_id
 
-        pending = dp_pending[dp_group]
-        if len(pending) != len(dp_groups[dp_group]):
+        if not dp_group_ready(dp_group):
             raise RuntimeError(
                 f"DP group {dp_group} is incomplete: "
-                f"{len(pending)}/{len(dp_groups[dp_group])} participants")
+                "at least one participant FIFO is empty")
+        pending = {
+            member_instance_id:
+                dp_pending[dp_group][member_instance_id].popleft()
+            for member_instance_id in dp_groups[dp_group]
+        }
 
         max_total_len = max(batch.total_len for batch, _ in pending.values())
         for batch, _ in pending.values():
@@ -1060,14 +1098,16 @@ def main():
 
             wave_id = next_wave_id
             workload_transport.prepare_wave(wave_id, wave_runs)
-            dp_active_systems[dp_group] = {
-                system.system_id
-                for _, patch in wave_runs
-                for system in patch.systems
-            }
+            for _, patch in wave_runs:
+                reporting_systems = sorted(
+                    system.system_id for system in patch.systems)
+                for system_id in {
+                        reporting_systems[0], reporting_systems[-1]}:
+                    dp_active_systems[dp_group][system_id] += 1
             next_wave_id += 1
             direct_submission_started = True
-            pending.clear()
+            if dp_group_ready(dp_group):
+                submit_dp_wave(dp_group, responder_instance_id)
             return
 
         for member_instance_id in dp_groups[dp_group]:
@@ -1127,8 +1167,13 @@ def main():
                 if submitted_system not in member_batch.fired:
                     member_batch.fired.append(submitted_system)
         workload_transport.run_wave(workload, wave_systems)
-        dp_active_systems[dp_group] = set(wave_systems)
-        pending.clear()
+        for member_instance_id in wave_member_ids:
+            member_start = inst2npu_mapping[member_instance_id]
+            member_end = instance_end_system(member_instance_id)
+            for system_id in {member_start, member_end}:
+                dp_active_systems[dp_group][system_id] += 1
+        if dp_group_ready(dp_group):
+            submit_dp_wave(dp_group, responder_instance_id)
 
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
@@ -1168,7 +1213,13 @@ def main():
         if out_dict != None:
             sys = out_dict['sys']
             id = out_dict['id']
-            current = out_dict['cycle']
+            event_time = out_dict['cycle']
+            if event_time < current:
+                host_timing.increment("completion_time_regressions")
+                logger.debug(
+                    "Clamping out-of-order event time for NPU[%d]: %d -> %d",
+                    sys, event_time, current)
+            current = _monotonic_event_time(current, event_time)
             router.observe_concurrency(current)
             workload_transport.set_system(sys)
             if reported_completion:
@@ -1264,7 +1315,7 @@ def main():
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
             dg = inst_dp_group[instance_id]
-            if dp_pending[dg]:
+            if dp_group_has_pending(dg):
                 # Emit a 1-token dummy; the uniform pad-to-max pass below
                 # brings it (and any undersized real peers) up to the
                 # group's max_total_len, matching vLLM's CUDA-graph DP padding.
@@ -1273,9 +1324,11 @@ def main():
                               1, 1, [1], [], 0, 1, [], [], [1], current, 0)
                 host_timing.increment("dummy_batches")
                 dummy.fired.append(sys)
-                dp_pending[dg][instance_id] = (dummy, inst2node_mapping[instance_id])
+                if not dp_pending[dg][instance_id]:
+                    dp_pending[dg][instance_id].append(
+                        (dummy, inst2node_mapping[instance_id]))
 
-                if len(dp_pending[dg]) == len(dp_groups[dg]):
+                if dp_group_ready(dg):
                     submit_dp_wave(dg, instance_id)
                     responded = True
                 else:
@@ -1294,9 +1347,9 @@ def main():
 
                 if dg is not None:
                     # DP group: defer trace generation until all members scheduled
-                    dp_pending[dg][instance_id] = (new_req, node_id)
+                    dp_pending[dg][instance_id].append((new_req, node_id))
 
-                    if len(dp_pending[dg]) == len(dp_groups[dg]):
+                    if dp_group_ready(dg):
                         submit_dp_wave(dg, instance_id)
                         responded = True
                     else:
@@ -1305,7 +1358,7 @@ def main():
                         responded = True
                         if not bootstrap_systems_remaining:
                             for peer_instance_id in dp_groups[dg]:
-                                if (peer_instance_id not in dp_pending[dg] and
+                                if (not dp_pending[dg][peer_instance_id] and
                                         not schedulers[peer_instance_id].inflight and
                                         not any(
                                             system_id in dp_active_systems[dg]
@@ -1623,7 +1676,7 @@ def main():
                 all_dp_empty = all(
                     schedulers[inst_id].is_request_empty() and len(schedulers[inst_id].inflight) == 0
                     for inst_id in dp_groups[dg]
-                ) and not dp_active_systems[dg]
+                ) and not dp_active_systems[dg] and not dp_group_has_pending(dg)
                 if not all_dp_empty:
                     # Other DP members still have work — keep this instance alive for dummy waves
                     if not responded:
@@ -1691,6 +1744,7 @@ def main():
                 all(not any(request.arrival <= current
                             for request in scheduler.request)
                     for scheduler in schedulers)
+                and _dp_execution_idle(dp_pending, dp_active_systems)
             )
             if (globally_idle and next_event is not None and
                     next_event > current):
@@ -1803,7 +1857,9 @@ def main():
         offload_schedulers = [
             schedulers[i] for i, cfg in enumerate(instance_runtime_configs)
             if (cfg["enable_kv_offloading"] or
-                cfg["enable_session_kv_retention"])
+                cfg["enable_session_kv_retention"] or
+                schedulers[i].get_kv_offload_stats()[
+                    "recompute_preemption_count"] > 0)
         ]
         if offload_schedulers:
             kv_offload_output = _kv_offload_output_file(output_file)

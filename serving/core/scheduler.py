@@ -19,6 +19,9 @@ import numpy as np
 @dataclass
 class KVOffloadStats:
     preemption_count: int = 0
+    recompute_preemption_count: int = 0
+    recompute_preemption_bytes: int = 0
+    recompute_preemption_tokens: int = 0
     evict_bytes: int = 0
     reload_bytes: int = 0
     eviction_batches: int = 0
@@ -576,6 +579,63 @@ class Scheduler:
                 load_size += self.memory.get_evict_kv(req)
         return load_size
 
+    def _fit_prefill_chunk_to_npu_capacity(
+            self, req, scheduled_tokens, capacity_limit):
+        """Return the largest positive prefill chunk that fits NPU memory."""
+        if (not self.enable_chunked_prefill or not req.is_prefill() or
+                req.pending_session_kv or req.is_kv_on_cpu()):
+            return 0
+        requested = scheduled_tokens.get(req.id, 0)
+        if requested <= 1:
+            return 0
+
+        base_usage = self.memory.npu_used + self.memory.npu_reserved
+        low = 1
+        high = requested
+        fitted = 0
+        while low <= high:
+            candidate = (low + high) // 2
+            candidate_tokens = {req.id: candidate}
+            kv_size = self.memory.get_block_kv(
+                [req], 1, candidate_tokens)
+            if base_usage + kv_size <= capacity_limit:
+                fitted = candidate
+                low = candidate + 1
+            else:
+                high = candidate - 1
+        return fitted
+
+    def _drop_parked_npu_sessions_for_progress(
+            self, req, current_time_ns):
+        """Drop optional parked session KV when neither memory tier can grow."""
+        if req is None:
+            return 0
+        minimum_tokens = {req.id: 1}
+        required = self.memory.get_block_kv(
+            [req], 1, minimum_tokens)
+        required += self._get_reload_size([req], 1)
+        shortage = (
+            self.memory.npu_used + self.memory.npu_reserved + required -
+            self.memory.npu_mem
+        )
+        if shortage <= 0:
+            return 0
+
+        candidates = sorted(
+            (state for state in self.session_kv_states.values()
+             if state.residency is KVResidency.NPU and
+             not state.invalidated),
+            key=lambda state: (state.last_access_ns, state.session_id),
+        )
+        freed = 0
+        for state in candidates:
+            freed += state.bytes_per_rank
+            self._release_session_kv(
+                state.session_id, current_time_ns, reason="capacity")
+            if freed >= shortage:
+                break
+        return freed
+
     def _select_offload_victim(self, requests):
         """Return one inactive decode request according to the configured policy."""
         if not requests:
@@ -594,6 +654,43 @@ class Scheduler:
         raise RuntimeError(
             f"Unsupported KV offload victim policy '{self.kv_offload_victim_policy}'. "
             "Supported policies: 'lru', 'largest-kv'.")
+
+    def _preempt_one_for_recompute(self, requests, current_time_ns):
+        """Discard one low-priority KV allocation to guarantee progress."""
+        if self.enable_prefix_caching:
+            return None
+        candidates = [
+            req for req in requests
+            if (req.num_computed_tokens > 0 and req.is_kv_on_npu() and
+                not req.pending_session_kv and
+                req.kv_owner_session_id is None)
+        ]
+        if not candidates:
+            return None
+
+        victim = max(candidates, key=lambda req: (req.arrival, req.id))
+        freed_bytes_per_rank = self.memory.get_evict_kv(victim)
+        if freed_bytes_per_rank <= 0:
+            return None
+
+        logical_tokens = victim.num_computed_tokens
+        self.memory.free(freed_bytes_per_rank, Device.NPU)
+        victim.begin_recompute_preemption()
+        victim.last_scheduled_ns = current_time_ns
+
+        stats = self._get_kv_offload_stats()
+        stats.preemption_count += 1
+        stats.recompute_preemption_count += 1
+        stats.recompute_preemption_bytes += (
+            freed_bytes_per_rank * self.num_npus)
+        stats.recompute_preemption_tokens += logical_tokens
+        self._record_kv_occupancy()
+        self.logger.warning(
+            "Recompute-preempted request #%d at %d tokens, freeing "
+            "%.2fMB per rank",
+            victim.id, logical_tokens,
+            freed_bytes_per_rank / MB_TO_BYTE)
+        return victim
 
     def _select_parked_session_victims(self, projected, target):
         """Select parked NPU sessions before considering active requests."""
@@ -925,7 +1022,7 @@ class Scheduler:
                 for state in mandatory_session_states:
                     self._release_session_kv(
                         state.session_id, current, reason="capacity")
-                return None
+                return self.schedule_base(current, sys, batch_id)
 
             handoff_batch = self._admit_pending_pd_handoff(current, sys)
             if handoff_batch is not None:
@@ -1034,7 +1131,9 @@ class Scheduler:
                     if req.is_prefill():
                         if token_budget <= 0:
                             break
-                        remaining = req.original_input - req.num_computed_tokens
+                        remaining = (
+                            req.prefill_target_tokens() -
+                            req.num_computed_tokens)
                         # Per-request cap: long_prefill_token_threshold
                         if 0 < threshold < remaining:
                             remaining = threshold
@@ -1185,7 +1284,38 @@ class Scheduler:
             batch_req = batch_req[:batch_len]
 
             if batch_len == 0:
-                return None
+                first_req = eligible_requests[0] if eligible_requests else None
+                fitted_chunk = (
+                    self._fit_prefill_chunk_to_npu_capacity(
+                        first_req, scheduled_tokens, effective_limit)
+                    if first_req is not None else 0
+                )
+                if fitted_chunk > 0:
+                    batch_req = [first_req]
+                    batch_len = 1
+                    scheduled_tokens = {first_req.id: fitted_chunk}
+                else:
+                    freed_session_kv = (
+                        self._drop_parked_npu_sessions_for_progress(
+                            first_req, current)
+                    )
+                    if freed_session_kv > 0:
+                        return self.schedule_base(current, sys, batch_id)
+                    victim = self._preempt_one_for_recompute(
+                        eligible_requests, current)
+                    if victim is not None:
+                        return self.schedule_base(current, sys, batch_id)
+                    self.logger.warning(
+                        "No progress path for request #%s: NPU %.2f/%.2fMB, "
+                        "reserved %.2fMB, pending_session=%s, kv_on_cpu=%s",
+                        first_req.id if first_req is not None else "none",
+                        self.memory.npu_used / MB_TO_BYTE,
+                        self.memory.npu_mem / MB_TO_BYTE,
+                        self.memory.npu_reserved / MB_TO_BYTE,
+                        bool(first_req and first_req.pending_session_kv),
+                        bool(first_req and first_req.is_kv_on_cpu()),
+                    )
+                    return None
 
             scheduled_tokens = {
                 req.id: scheduled_tokens[req.id]
@@ -1206,6 +1336,16 @@ class Scheduler:
                     session_reload_requests[0], current, sys)
                 if migration_batch is not None:
                     return migration_batch
+                self.logger.warning(
+                    "Session reload for request #%d cannot reserve %.2fMB: "
+                    "NPU %.2f/%.2fMB, reserved %.2fMB",
+                    session_reload_requests[0].id,
+                    session_reload_requests[0].pending_session_kv_bytes_per_rank /
+                    MB_TO_BYTE,
+                    self.memory.npu_used / MB_TO_BYTE,
+                    self.memory.npu_mem / MB_TO_BYTE,
+                    self.memory.npu_reserved / MB_TO_BYTE,
+                )
                 return None
 
             reload_requests = [req for req in batch_req if req.is_kv_on_cpu()]
@@ -1213,6 +1353,14 @@ class Scheduler:
                 migration_batch = self._start_kv_reload(reload_requests, current, sys)
                 if migration_batch is not None:
                     return migration_batch
+                self.logger.warning(
+                    "KV reload for request #%d cannot start: NPU %.2f/%.2fMB, "
+                    "reserved %.2fMB",
+                    reload_requests[0].id,
+                    self.memory.npu_used / MB_TO_BYTE,
+                    self.memory.npu_mem / MB_TO_BYTE,
+                    self.memory.npu_reserved / MB_TO_BYTE,
+                )
                 return None
 
             # ============ STEP 4: Build the compute batch without mutation ============
@@ -1228,7 +1376,10 @@ class Scheduler:
             for req in batch_req:
                 if req.is_prefill():
                     # Use scheduled_tokens for chunk size
-                    chunk_size = scheduled_tokens.get(req.id, req.original_input - req.num_computed_tokens)
+                    chunk_size = scheduled_tokens.get(
+                        req.id,
+                        req.prefill_target_tokens() -
+                        req.num_computed_tokens)
 
                     total_len += chunk_size
                     q_list.append(chunk_size)
@@ -1773,67 +1924,60 @@ class Scheduler:
         pool = []
         for req in batch.requests:
             req.last_scheduled_ns = finish
-            # For chunked prefill, use computed tokens to determine prefill vs decode
-            # Use is_prefill() method which checks num_computed_tokens < original_input
+            # For chunked prefill, use computed tokens to determine prefill vs decode.
             is_prefill_req = req.is_prefill()
             
             # change phase
             if is_prefill_req:
-                # Get chunk_len from scheduling step
-                chunk_len = req.chunk_len if req.chunk_len > 0 else (req.original_input - req.num_computed_tokens)
+                target_tokens = req.prefill_target_tokens()
+                is_recompute_prefill = (
+                    req.recompute_kv_target_tokens is not None)
+                chunk_len = (
+                    req.chunk_len if req.chunk_len > 0
+                    else target_tokens - req.num_computed_tokens)
                 if chunk_len > self.max_num_batched_tokens:
                     raise Exception("Chunk length exceeds max num batched tokens")
 
-                # Update num_computed_tokens
                 req.num_computed_tokens += chunk_len
-                req.chunk_len = 0  # Reset for next step
+                req.chunk_len = 0
                 
-                # Check if prefill is complete
-                if req.num_computed_tokens >= req.original_input:
-                    # Update prefix cache before clearing is_init (for stats tracking)
-                    if self.enable_prefix_caching:
-                        self.memory.cache_unfinished_req(req, Device.NPU)
-                        if self.prefix_storage is not None:
-                            self.memory.cache_unfinished_req(req, self.prefix_storage)
-                    req.is_init = False
-                    # Include prefix cache hit tokens in prompt throughput
-                    prompt_t += chunk_len + req.prefix_cache_hit
-                    req.set_ttft(finish)
-                    
-                    if self.pd_type == "prefill":
-                        # Prefill instance: send to decode instance
-                        self.logger.info("Request #%d is prefill done", req.id)
-                        self.logger.info("Request #%d is sent to decode instance", req.id)
-                        # The final prefill token passes through lm_head and
-                        # produces the first output token, just as in the
-                        # colocated path below. The token is implicit in
-                        # num_computed_tokens but must be counted in throughput.
-                        gen_t += 1
-                        
-                        # In the offload-aware same-node PD path, source KV
-                        # remains owned by this instance until the decode
-                        # scheduler reserves and commits destination capacity.
-                        if self.enable_prefix_caching:
-                            self.memory.unlock_prefix(req, Device.NPU)
-                        elif not self.enable_kv_offloading:
-                            kv_size = self.memory.get_evict_kv(req)
-                            self.memory.free(kv_size, Device.NPU)
-
-                        end_reqs.append(req)
-                        continue
+                if req.num_computed_tokens >= target_tokens:
+                    if is_recompute_prefill:
+                        req.finish_recompute_prefill()
+                        self.logger.info(
+                            "Request #%d finished recomputing %d KV tokens",
+                            req.id, target_tokens)
                     else:
-                        # Non-PD: prefill complete, first output token generated
-                        # The last prefill token passing through lm_head generates the first output
+                        # Update prefix cache before clearing is_init.
+                        if self.enable_prefix_caching:
+                            self.memory.cache_unfinished_req(req, Device.NPU)
+                            if self.prefix_storage is not None:
+                                self.memory.cache_unfinished_req(
+                                    req, self.prefix_storage)
+                        req.is_init = False
+                        prompt_t += chunk_len + req.prefix_cache_hit
+                        req.set_ttft(finish)
+
+                        if self.pd_type == "prefill":
+                            self.logger.info(
+                                "Request #%d is prefill done", req.id)
+                            self.logger.info(
+                                "Request #%d is sent to decode instance",
+                                req.id)
+                            # Initial prefill implicitly produces token one.
+                            gen_t += 1
+                            if self.enable_prefix_caching:
+                                self.memory.unlock_prefix(req, Device.NPU)
+                            elif not self.enable_kv_offloading:
+                                kv_size = self.memory.get_evict_kv(req)
+                                self.memory.free(kv_size, Device.NPU)
+
+                            end_reqs.append(req)
+                            continue
+                        # Colocated initial prefill also produces token one.
                         gen_t += 1
-                        # req.num_computed_tokens += 1  # Count the first generated token
-                        # req.set_ttft(finish)
-                        # pool.append(req)
-                        # continue
-                else:
-                    # Prefill not complete, return to pool for next chunk
+                elif not is_recompute_prefill:
                     prompt_t += chunk_len
-                    # pool.append(req)
-                    # continue
             else:
                 # Decode phase
                 if req.is_init:
@@ -2054,6 +2198,15 @@ class Scheduler:
                     f"bytes: {stats['pd_handoff_bytes'] / MB_TO_BYTE:.2f} MB, "
                     f"admission wait: "
                     f"{stats['pd_handoff_wait_ns'] / 1_000_000:.3f} ms")
+        stats = self.get_kv_offload_stats()
+        if stats['recompute_preemption_count']:
+            print_rule("[sim.tagline]Recompute Preemption[/]")
+            print_markup(
+                f"Preemptions: {stats['recompute_preemption_count']}, "
+                f"discarded KV: "
+                f"{stats['recompute_preemption_bytes'] / MB_TO_BYTE:.2f} MB, "
+                f"recomputed tokens: "
+                f"{stats['recompute_preemption_tokens']}")
         if self.enable_session_kv_retention:
             stats = self.get_kv_offload_stats()
             print_rule("[sim.tagline]Session KV Retention[/]")
@@ -2136,6 +2289,8 @@ class Scheduler:
         stats = self.get_kv_offload_stats()
         columns = [
             'instance id', 'node id', 'preemption count',
+            'recompute preemption count', 'recompute preemption bytes',
+            'recompute preemption tokens',
             'eviction batches', 'reload batches', 'evict bytes',
             'reload bytes', 'migration time ns', 'eviction time ns',
             'reload time ns', 'reload stall count', 'reload stall ns',
@@ -2158,6 +2313,9 @@ class Scheduler:
         ]
         row = [
             self.instance_id, self.node_id, stats['preemption_count'],
+            stats['recompute_preemption_count'],
+            stats['recompute_preemption_bytes'],
+            stats['recompute_preemption_tokens'],
             stats['eviction_batches'], stats['reload_batches'],
             stats['evict_bytes'], stats['reload_bytes'],
             stats['migration_time_ns'], stats['eviction_time_ns'],

@@ -27,6 +27,17 @@ _GAP_PROFILES = {
     ),
 }
 
+_CONTEXT_PROFILES = {
+    "standard": {
+        "initial": (1024, 0.8, 256, 8192),
+        "new": (256, 0.9, 16, 4096),
+    },
+    "long": {
+        "initial": (8192, 0.55, 4096, 16384),
+        "new": (2048, 0.7, 256, 8192),
+    },
+}
+
 
 def register_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-sessions", type=int, required=True)
@@ -36,6 +47,8 @@ def register_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--output", required=True)
     parser.add_argument("--gap-profile", choices=sorted(_GAP_PROFILES),
                         default="mixed")
+    parser.add_argument("--context-profile", choices=sorted(_CONTEXT_PROFILES),
+                        default="standard")
     parser.add_argument("--first-arrival-sec", type=float, default=0.0)
     parser.add_argument("--max-turns", type=int, default=12)
     parser.add_argument("--turn-stop-prob", type=float, default=0.25)
@@ -77,6 +90,9 @@ def generate_sessions(args):
         raise ValueError("turn_stop_prob must be in (0, 1].")
 
     rng = random.Random(args.seed)
+    context_profile = _CONTEXT_PROFILES[args.context_profile]
+    initial_spec = context_profile["initial"]
+    new_context_spec = context_profile["new"]
     arrival_ns = int(round(args.first_arrival_sec * 1_000_000_000))
     sessions = []
     for session_index in range(args.num_sessions):
@@ -85,7 +101,7 @@ def generate_sessions(args):
                 rng.expovariate(args.session_rate) * 1_000_000_000))
         target_turns = _sample_turn_count(
             rng, args.max_turns, args.turn_stop_prob)
-        input_toks = _bounded_lognormal(rng, 1024, 0.8, 256, 8192)
+        input_toks = _bounded_lognormal(rng, *initial_spec)
         sub_requests = []
         for turn_index in range(target_turns):
             output_toks = _bounded_lognormal(rng, 128, 0.7, 16, 1024)
@@ -97,7 +113,7 @@ def generate_sessions(args):
             sub_requests.append(sub_request)
             if turn_index + 1 >= target_turns:
                 break
-            new_context = _bounded_lognormal(rng, 256, 0.9, 16, 4096)
+            new_context = _bounded_lognormal(rng, *new_context_spec)
             next_input = input_toks + output_toks + new_context
             if next_input > args.max_context_toks:
                 break

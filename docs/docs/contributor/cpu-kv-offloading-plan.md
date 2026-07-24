@@ -411,6 +411,7 @@ one pressure workload whose total live KV exceeds NPU capacity.
 | NPU-only capacity fits | No migrations; results match the existing baseline within trace changes. |
 | CPU offload, one victim | One D2H eviction followed by one H2D reload; capacity never exceeds either tier. |
 | Repeated pressure | Victim order follows configured policy; no negative counters or duplicate ownership. |
+| Recompute pressure | A low-priority active KV allocation is discarded and rebuilt; logical token and TTFT accounting is unchanged. |
 | CPU capacity exhausted | Admission stalls or fails with a clear error; no source NPU block is lost. |
 | PD without pressure | Direct prompt-KV handoff; no CPU traffic solely due to handoff. |
 | PD with decode pressure | Decode instance offloads the combined prompt-plus-decode history; prefill has no live copy after handoff. |
@@ -501,3 +502,10 @@ step. A step is complete only after its focused validation passes.
   execution to the server runner. Each child uses one OpenMP/BLAS thread, and
   analytical ASTRA-Sim now uses process-specific temporary memory-config
   directories so independent cases can run safely at the same time.
+- 2026-07-22: Added finite-capacity preemption to the Recompute policy. When a
+  compute batch cannot reserve NPU KV, the scheduler discards a low-priority
+  active request allocation and rebuilds it to its saved logical position.
+  Rebuild chunks preserve TTFT and do not duplicate prompt or generated-token
+  accounting. A 200-session confirmation completed all 946 LLM calls after 35
+  preemptions, discarding 8,944 MiB of KV and rebuilding 71,282 tokens; input
+  and generated totals matched Session-offload at 2,575,491 and 155,203.

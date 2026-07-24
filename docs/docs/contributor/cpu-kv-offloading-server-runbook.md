@@ -162,8 +162,8 @@ column -s, -t < "${RUN_ROOT}/summary.csv" | less -S
 `pilot.json` records `lambda_sat`, low/high/overload rates, and the transport-
 oracle validation result. `summary.csv` contains operational status, wall and
 simulated time, request/session latency percentiles, session makespan,
-throughput, migrations, NPU/CPU hits, misses, recomputed tokens, and capacity
-drops.
+throughput, migrations, Recompute preemptions/discarded KV/rebuilt tokens,
+NPU/CPU hits, misses, session recomputed tokens, and capacity drops.
 
 If `calibration_upper_bound_reached` is `true`, the highest tested rate also
 completed. Create a new run directory and extend the range before treating
